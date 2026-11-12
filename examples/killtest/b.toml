@@ -1,0 +1,19 @@
+# Kill test, job b: started, then the gpu-ops process is killed with kill -9 while the command sleeps.
+# Proves cleanup without gpu-ops: dead-man timer (if armed), `gpu-ops reap`, `gpu-ops kill --all`.
+name = "killtest-b"
+project = "gpu-ops"
+
+[image]
+ref = "docker.io/library/python@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b"
+
+[run]
+command = "echo killtest-started; sleep 600"
+disk_gb = 20
+
+[gpu]
+min_vram_gb = 16
+max_price_per_hr = 0.99
+
+[limits]
+max_minutes = 10
+max_cost_usd = 0.17

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*gpu-ops schema*)",
+      "Bash(*gpu-ops validate *)",
+      "Bash(*gpu-ops plan *)",
+      "Bash(*gpu-ops pin-image *)",
+      "Bash(*gpu-ops ps*)",
+      "Bash(*gpu-ops spend*)",
+      "Bash(*gpu-ops kill *)",
+      "Bash(*gpu-ops reap*)"
+    ],
+    "ask": [
+      "Bash(*gpu-ops run *)",
+      "PowerShell(*gpu-ops* run *)"
+    ],
+    "deny": [
+      "Edit(~/.config/gpu-ops/**)",
+      "Write(~/.config/gpu-ops/**)",
+      "Bash(*gpu-ops init*)"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Windows-side wrapper (Git Bash): runs gpu-ops inside WSL, in the current directory.
+# Put this folder on your Windows PATH, or call it by full path.
+# The WSL side needs `gpu-ops` on its PATH:  uv tool install --editable /mnt/c/Users/cuzel/src/gpu-ops
+export MSYS_NO_PATHCONV=1
+exec wsl.exe -e bash -lc 'exec gpu-ops "$@"' gpu-ops "$@"
