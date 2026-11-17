@@ -101,6 +101,8 @@ Every command prints one object, which always has `ok` (bool) and `exit_code` (i
 
 - **Images:** Debian or Ubuntu based only. The machine installs `openssh-server`, `rsync` and `curl` at boot if they are missing.
 - **No serving jobs, sessions, detached runs or network volumes yet.**
-- **1Password prompts:** every gpu-ops call reads the provider key through the Windows 1Password app. A call can fail with exit 3 ("authorization timeout") if nobody approves the prompt. Tell the human rather than retrying in a loop.
+- **1Password prompts:** without a service account ([docs/unattended.md](docs/unattended.md)), each gpu-ops call reads the provider key through the Windows 1Password app.
+  - A call can fail with exit 3 ("authorization timeout") if nobody approves the prompt.
+  - Tell the human rather than retrying in a loop.
 - **Dead-man timer:** verified on RunPod 2026-11-12. If `record.deadman` is `unarmed`, `record.notes` says what was missing.
 - **Killed runs:** a run whose gpu-ops process died (exit code null, status `started`) is counted in `spend` at its upper bound until reconciled. Check `gpu-ops ps` for leftovers.

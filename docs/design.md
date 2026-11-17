@@ -239,7 +239,9 @@ Each layer covers the failure of the one before it.
 - Instances without the prefix are never touched, so your manual pods are safe.
 - The ledger only adds detail to the reaper's report, for example "this one belonged to run X of project Y". If the ledger is lost, the reaper loses no capability.
 
-**Open item: the scheduled reaper and 1Password.** Seen on 2026-11-11: a `gpu-ops plan` call from a new `wsl.exe` process failed with 1Password "authorization timeout" when nobody approved the prompt. gpu-ops reports this as exit 3, not a crash.
+**Resolved 2026-11-12: unattended access uses a 1Password service account** (option 1 below), with its token in Windows Credential Manager. See `docs/unattended.md`. The desktop app remains the fallback. Verified live 2026-11-16: commands read the key with the desktop route disabled.
+
+**Open item (historical): the scheduled reaper and 1Password.** Seen on 2026-11-11: a `gpu-ops plan` call from a new `wsl.exe` process failed with 1Password "authorization timeout" when nobody approved the prompt. gpu-ops reports this as exit 3, not a crash.
 - An unattended task has to read the RunPod key. Through `op.exe` that needs the 1Password desktop app unlocked, and it may show an approval prompt.
 - So the reaper probably fails exactly when you're away. I will test this, not assume it.
 - If it does fail, the options for you to choose from then:
