@@ -3,7 +3,7 @@
 Users of the CLI (including agents running GPU jobs) read AGENTS.md; this file is for changing the code.
 
 ## Where to work
-- `C:\Users\cuzel\src\gpu-ops` is the **live install**: the WSL `gpu-ops` command (editable `uv tool` install) and the scheduled reaper run its files directly. Keep it on a clean, pushed `main`; never edit or switch branches there.
+- `C:\Users\cuzel\src\gpu-ops` is the **live install**: the WSL `gpu-ops` command (editable `uv tool` install) and the scheduled reaper run its files directly. Keep it on a clean, pushed `main`; never switch branches there. Code changes go through a worktree; a doc-only one-liner may be committed in place.
 - Do all changes in a git worktree, one per branch: `git worktree add ../gpu-ops-wt/<branch> -b <branch> origin/main`; remove it after the PR merges (`git worktree remove`). Add and remove them with **Windows** git: worktrees are registered by absolute path, so one created as `C:/…` is invisible to WSL git ("not a working tree").
 
 ## Build & test
@@ -12,12 +12,15 @@ Users of the CLI (including agents running GPU jobs) read AGENTS.md; this file i
 - From Git Bash always set `MSYS_NO_PATHCONV=1` before `wsl`, or `/mnt/c/...` args get rewritten.
 - To try your branch's CLI without touching the installed one: `uv run gpu-ops …` inside your worktree (same `UV_PROJECT_ENVIRONMENT`).
 - Test new behaviour against the fake provider (`GPUOPS_ENABLE_FAKE=1`, `providers/fake.py`) + `LocalRemote`; see `tests/test_runner.py`.
+- `teardown()` swallows its own exceptions, so `terminate_failures` never reaches `_release`'s error path; use the fake's `list_raises` to exercise it.
 
 ## Rules
 - Never run a real `gpu-ops run` (or anything that creates a pod) without the human's explicit OK; `validate`, `plan`, `ps`, `reap --dry-run` are free.
 - Never edit `~/.config/gpu-ops/` (policy, providers) without the human's OK.
 - Exit codes in `errors.py` are a public contract: never renumber.
 - When behaviour changes, update AGENTS.md, the README status table, and docs/design.md.
+- Put a new invariant on a type or a validator, never in a convention a caller must remember; see docs/design.md §5.
+- Assert the result payload, not just `exit_code`: a stub carries the right code, so an exit-code-only test passes against one.
 
 ## Gotchas
 - RunPod: use REST v2 only (`https://api.runpod.io/v2/openapi.json`; each op lists its key scope in `x-runpod-scope`). Catalog `maxCount` is a ceiling, not stock — stock needs `include=AVAILABILITY&product=POD`.
