@@ -91,7 +91,7 @@ class Runner:
         self.instance: Instance | None = None
         self.remote: Remote | None = None
         self.key_dir: Path | None = None
-        self.run_dir = ledger.run_dir(self.run_id)
+        self.run_dir = ledger.ensure_run_dir(self.run_id)
         self.record = RunRecord(run_id=self.run_id, job=self.spec.name, project=self.spec.project,
                                 kind=self.spec.kind, spec_path=str(loaded.path), image=self.spec.image.ref)
         self._apply_plan(plan)
@@ -181,9 +181,16 @@ class Runner:
         self.record.status = "ok" if code == ExitCode.OK else "failed"
         if self.spec.report is not None and self.record.report is None:
             self.record.notes.append("report omitted: the outputs were not downloaded and verified")
-        # one scrub of the whole record, before anything persists, prints or returns it:
-        # notes and report carry provider and job text, and no field should need its own call
-        self.record = RunRecord(**self.redact.scrub(self.record.to_dict()))
+        # Redaction is per field (see RunRecord's metadata) and sets only named fields, so it
+        # cannot invent or drop one. Guarded anyway: this runs after teardown, and a run that
+        # spent money must leave a record even if redacting it somehow fails.
+        try:
+            self.record = self.redact.scrub_record(self.record)
+        except Exception as e:  # pragma: no cover - defence for a path that should not exist
+            self.record.error = self.record.error and "[redaction failed]"
+            self.record.notes = ["[redaction failed, notes withheld]"]
+            self.record.report = None
+            self.record.notes.append(f"could not redact the record: {type(e).__name__}")
         self.ledger.write_record(self.record)
         return code, self.record
 
@@ -199,8 +206,8 @@ class Runner:
         self.inputs_manifest = full
         self.record.inputs_hash = manifest_digest(full)
         self.record.inputs_file_count = len(full)
-        (self.run_dir / "inputs-manifest.json").write_text(json.dumps(full, indent=2, sort_keys=True),
-                                                           encoding="utf-8")
+        (self.run_dir / "inputs-manifest.json").write_text(
+            json.dumps(self.redact.scrub(full), indent=2, sort_keys=True), encoding="utf-8")
 
     def _acquire(self) -> None:
         with self._phase("provision"):
@@ -387,8 +394,15 @@ class Runner:
                 self.record.notes.append(f"report file missing from the outputs: {rel}")
                 continue
             # read the cap, never the whole file: a report file is an output, and outputs
-            # can be checkpoints. Secrets are redacted once, at the boundaries in run().
-            raw, size = read_head_bytes(path, rs.max_bytes)
+            # can be checkpoints. Secrets are redacted once, per field, in run().
+            try:
+                raw, size = read_head_bytes(path, rs.max_bytes)
+            except GpuOpsError as e:
+                # a file that vanished or turned unreadable between the check and the read is
+                # the missing-optional-output case, not an internal error
+                report[rel] = None
+                self.record.notes.append(f"report file could not be read: {rel} ({e.message})")
+                continue
             text = raw.decode("utf-8", "replace")
             if size > rs.max_bytes:
                 report[rel] = {"truncated": True, "bytes": size, "text": text}

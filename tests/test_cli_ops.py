@@ -19,7 +19,7 @@ from gpu_ops.ops import reap_decisions
 from gpu_ops.policy import Policy
 from gpu_ops.providers.base import CreateRequest, Instance
 from gpu_ops.providers.fake import DEFAULT_OFFERS, FakeProvider
-from gpu_ops.result import compact
+from gpu_ops.result import compact, result
 from gpu_ops.spend import summarize
 
 from .conftest import write_spec
@@ -69,7 +69,7 @@ def test_full_run_via_cli(env: Path):
 
 
 # derived, not hand-copied: the shape is compact()'s to define, and it must not vary per run
-COMPACT_FIELDS = set(compact({}, Path(".")))
+COMPACT_FIELDS = set(result(0, **compact({}, Path("."), [])))
 
 
 def test_run_json_is_compact_by_default(env: Path):
@@ -202,10 +202,48 @@ def test_a_bad_get_path_on_a_clean_run_is_still_exit_2(env: Path):
 
 
 def test_get_works_on_schema(env: Path):
-    r = cli("schema", "--get", "$defs.LimitsSpec.properties")  # it used to accept --get and ignore it
+    r = cli("schema", "--get", "schema.$defs.LimitsSpec.properties")
     assert r.returncode == 0, r.stderr
     assert "max_cost_usd" in r.stdout
     assert "min_vram_gb" not in r.stdout  # only the selected subtree
+
+
+def test_schema_carries_ok_and_exit_code_like_every_command(env: Path):
+    r = cli("schema", "--json")
+    assert r.returncode == 0
+    out = json.loads(r.stdout)
+    assert out["ok"] is True and out["exit_code"] == 0
+    assert "max_cost_usd" in json.dumps(out["schema"])
+
+
+def test_logs_does_not_create_a_directory_for_an_unknown_run(env: Path):
+    """A free, read-only command must not leave state behind."""
+    run_id = "20261112T140915-beef"
+    r = cli("logs", run_id, "--json")
+    assert r.returncode == ExitCode.SPEC_INVALID
+    assert not (env / "state" / "runs" / run_id).exists()
+
+
+def test_reconcile_skips_a_record_it_cannot_read(env: Path):
+    """One unreadable record must not cost the caller the whole report."""
+    prov = FakeProvider(env / "fake")
+    inst = prov.create(CreateRequest(name=instance_name(new_run_id(), 1, "ok"), offer=DEFAULT_OFFERS[0],
+                                     image="x", bootstrap="", public_key=""))
+    good, bad = new_run_id(), new_run_id()
+    for rid, extra in ((good, {}), (bad, {"started_at": "not-a-timestamp"})):
+        d = env / "state" / "runs" / rid
+        d.mkdir(parents=True)
+        (d / "record.json").write_text(json.dumps({
+            "run_id": rid, "job": "j", "project": "tests", "kind": "other", "spec_path": "x",
+            "provider": "fake", "instance_id": inst.id, "started_at": "2026-11-01T10:00:00+00:00",
+            "price_per_hr": 0.2, "gpu_count": 1, **extra}))
+
+    r = cli("spend", "--reconcile", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["reconciled_now"] == 1  # the readable one still got done
+    assert len(out["reconcile_skipped"]) == 1 and bad in out["reconcile_skipped"][0]
+    assert out["runs"] == 2  # and the report itself was still produced
 
 
 def test_reconcile_keeps_fields_this_version_does_not_know(env: Path):

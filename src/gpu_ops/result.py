@@ -9,6 +9,11 @@ site that re-derived them got one of them wrong:
 - **Read only what you need.** Nothing here materializes a whole file to return a slice
   of it; a job.log is a stream, and a report file is read up to its cap.
 
+Error policy for the readers here: an unreadable file is a `GpuOpsError` (exit 2), not a
+bare OSError, so a caller never sees "internal error" for a missing file. `tail_lines` is
+the one exception and returns `[]`, because a failed run that never wrote a job.log is
+ordinary and its tail is decoration, not the answer.
+
 The compact shape is part of the CLI contract (AGENTS.md): add fields, never rename them,
 and keep the key set the same on every run so a caller can index it without guarding.
 """
@@ -29,15 +34,25 @@ PHASE_MARKER = "[gpu-ops] phase: "  # written into job.log so `logs --phase` can
 _INDEX = re.compile(r"-?\d+")
 
 
-def compact(rec: dict, run_dir: Path, declared_outputs: list[str] | None = None) -> dict:
+def result(code: "int | ExitCode", **fields: Any) -> dict:
+    """Every command's result object.
+
+    `ok` and `exit_code` are supplied here rather than typed into ten literal dicts, so a
+    command cannot forget them and AGENTS.md's "always has ok and exit_code" stays true by
+    construction.
+    """
+    return {"ok": int(code) == int(ExitCode.OK), "exit_code": int(code), **fields}
+
+
+def compact(rec: dict, run_dir: Path, declared_outputs: list[str]) -> dict:
     """The default `run` result: what an agent needs to decide what to do next.
 
     `rec` is a run record as a dict (`RunRecord.to_dict()`, or a parsed record.json).
     No per-file hashes, no inputs manifest, no phase timings — those are in `--full`.
 
-    `declared_outputs` is the spec's `[[outputs]]` paths, which is what keeps `outputs`
-    bounded; without them (a record read back without its spec) each verified file is
-    listed instead.
+    `declared_outputs` is the spec's `[[outputs]]` paths. It is required, not optional:
+    sizing per declared output is the only thing that keeps `outputs` from growing with the
+    number of files the job wrote, and an optional bound is one a caller can silently skip.
     """
     out_dir = run_dir / "out"
     gpu = rec.get("gpu_name") or "?"
@@ -45,10 +60,9 @@ def compact(rec: dict, run_dir: Path, declared_outputs: list[str] | None = None)
         gpu = f"{gpu} x{rec['gpu_count']}"
     secs = rec.get("billed_seconds")
     ok = rec.get("exit_code") == 0
-    # every key is always present: a caller that must guard each lookup is a caller that breaks
+    # every key is always present: a caller that must guard each lookup is a caller that breaks.
+    # `ok` and `exit_code` are not here — `result()` supplies those for every command alike.
     return {
-        "ok": ok,
-        "exit_code": rec.get("exit_code"),
         "run_id": rec.get("run_id"),
         "status": rec.get("status"),
         "error": rec.get("error"),
@@ -68,16 +82,13 @@ def compact(rec: dict, run_dir: Path, declared_outputs: list[str] | None = None)
     }
 
 
-def output_sizes(out_dir: Path, manifest: dict[str, str],
-                 declared: list[str] | None = None) -> dict[str, Any]:
-    """Each output and its size in bytes. Sizes, not hashes: hashes are in `--full`.
+def output_sizes(out_dir: Path, manifest: dict[str, str], declared: list[str]) -> dict[str, Any]:
+    """Each declared output and its size in bytes. Sizes, not hashes: hashes are in `--full`.
 
-    A declared output that is a directory collapses to `{"bytes": n, "files": n}` — listing
-    one entry per file would make the result grow with the job's output, which is the whole
-    thing the compact result exists to avoid.
+    A directory collapses to `{"bytes": n, "files": m}`: one entry per file would make the
+    result grow with the job's output, which is what the compact result exists to avoid.
+    Outputs cannot overlap (the spec forbids it), so no file is counted twice.
     """
-    if not declared:
-        return {rel: _size(out_dir / rel) for rel in sorted(manifest)}
     sizes: dict[str, Any] = {}
     for path in declared:
         members = [k for k in manifest if k == path or k.startswith(path + "/")]
@@ -85,9 +96,12 @@ def output_sizes(out_dir: Path, manifest: dict[str, str],
             continue  # an optional output the job did not write
         if members == [path]:
             sizes[path] = _size(out_dir / path)
-        else:
-            total = sum(s for s in (_size(out_dir / m) for m in members) if s is not None)
-            sizes[path] = {"bytes": total, "files": len(members)}
+            continue
+        found = [_size(out_dir / m) for m in members]
+        # bytes is null when any member could not be read, so 0 means "all empty" and never
+        # "some were unreadable" — the same meaning None has for a single file, and one fixed
+        # key set either way
+        sizes[path] = {"bytes": None if None in found else sum(found), "files": len(members)}
     return sizes
 
 
@@ -115,9 +129,12 @@ def tail_lines(path: Path, n: int) -> list[str]:
 
 def read_head_bytes(path: Path, limit: int) -> tuple[bytes, int]:
     """The first `limit` bytes, and the file's real size (so the caller can say "truncated")."""
-    size = path.stat().st_size
-    with path.open("rb") as f:
-        return f.read(limit), size
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            return f.read(limit), size
+    except OSError as e:
+        raise GpuOpsError(ExitCode.SPEC_INVALID, f"cannot read {path}: {e}")
 
 
 def read_log(path: Path, *, tail: int = DEFAULT_LOG_TAIL, grep: str | None = None,
@@ -176,40 +193,52 @@ def select(result: dict, paths: str) -> dict:
 _MISSING = object()
 
 
+def _depth(at: str) -> int:
+    """How far into the result a path fragment reached. "" is the top level."""
+    return 0 if not at else at.count(".") + 1
+
+
 def _dig(obj: Any, path: str) -> Any:
     """Resolve one dotted path, or raise exit 2 — never a bare exception."""
-    deepest = {"at": "", "keys": sorted(map(str, obj)) if isinstance(obj, dict) else []}
-    value = _resolve(obj, path, deepest)
+    value, at, options = _resolve(obj, path, "")
     if value is _MISSING:
-        where = f" at {deepest['at']!r}" if deepest["at"] else ""
-        available = ", ".join(deepest["keys"]) or "nothing to index"
+        where = f" at {at!r}" if at else ""
         raise GpuOpsError(ExitCode.SPEC_INVALID,
-                          f"--get {path!r}: no such field{where} (available: {available})")
+                          f"--get {path!r}: no such field{where} "
+                          f"(available: {', '.join(options) or 'nothing to index'})")
     return value
 
 
-def _resolve(cur: Any, rest: str, deepest: dict) -> Any:
+def _resolve(cur: Any, rest: str, at: str) -> tuple[Any, str, list[str]]:
+    """Returns (value, where-it-failed, what-was-available-there).
+
+    The failure context is returned rather than accumulated in a shared holder: the search
+    backtracks, so a holder would keep the branch that was abandoned and the error would
+    name a subtree the caller never asked about.
+    """
     if not rest:
-        return cur
+        return cur, at, []
     if isinstance(cur, dict):
         parts = rest.split(".")
-        for i in range(len(parts), 0, -1):  # longest prefix first: a file name may contain dots
-            head = ".".join(parts[:i])
+        best_at, best_options = at, sorted(map(str, cur))
+        for i in range(len(parts), 0, -1):  # longest prefix first: names contain dots
+            head, tail = ".".join(parts[:i]), ".".join(parts[i:])
             if head not in cur:
                 continue
-            tail = ".".join(parts[i:])
-            if tail and isinstance(cur[head], dict):
-                deepest.update(at=head, keys=sorted(map(str, cur[head])))
-            got = _resolve(cur[head], tail, deepest)
+            got, deeper_at, deeper = _resolve(cur[head], tail, f"{at}.{head}" if at else head)
             if got is not _MISSING:
-                return got  # a longer prefix that dead-ends falls back to a shorter one
-        return _MISSING
+                return got, "", []  # a longer prefix that dead-ends falls back to a shorter one
+            # report the deepest point any branch reached, not the last one tried
+            if deeper and _depth(deeper_at) > _depth(best_at):
+                best_at, best_options = deeper_at, deeper
+        return _MISSING, best_at, best_options
     if isinstance(cur, list):
         head, _, tail = rest.partition(".")
+        options = [f"indexes 0..{len(cur) - 1}"] if cur else ["an empty list"]
         if not _INDEX.fullmatch(head) or not -len(cur) <= int(head) < len(cur):
-            return _MISSING
-        return _resolve(cur[int(head)], tail, deepest)
-    return _MISSING
+            return _MISSING, at, options
+        return _resolve(cur[int(head)], tail, f"{at}.{head}" if at else head)
+    return _MISSING, at, [f"a {type(cur).__name__}, which has no fields"]
 
 
 def dumps(obj: Any) -> str:

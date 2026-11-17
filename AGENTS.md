@@ -29,12 +29,12 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 
 | Command | Cost | What it does |
 |---|---|---|
-| `gpu-ops schema` | free | Prints the job spec's JSON Schema. Read it to write a spec. |
+| `gpu-ops schema` | free | The job spec's JSON Schema, under `schema`. Read it to write a spec. |
 | `gpu-ops validate SPEC` | free | Checks the spec and that its inputs exist. |
 | `gpu-ops plan SPEC` | free | Picks an offer and prices the worst case against policy. Creates nothing. Same as `run --dry-run`. |
 | `gpu-ops run SPEC` | **money** | The full run: create, upload, setup, command, download and verify, then delete the machine. Blocks until done. Prints a compact result; `--full` prints the whole record, `--progress` streams the job's output to stderr. |
 | `gpu-ops logs RUN_ID` | free | Lines from a finished run's `job.log`. `--tail N` (default 200, `0` = all), `--grep REGEX`, `--phase setup\|command`. |
-| `gpu-ops schema --get PATH` | free | `--get` drills into the schema itself, e.g. `--get '$defs.LimitsSpec.properties'`. |
+| `gpu-ops schema --get PATH` | free | `--get` drills into the schema, e.g. `--get 'schema.$defs.LimitsSpec.properties'`. |
 | `gpu-ops ps` | free | Live gpu-ops machines, as the provider reports them. |
 | `gpu-ops kill ID… \| --all` | stops spend | Deletes gpu-ops machines. Never touches machines without the `gpuops-` prefix. |
 | `gpu-ops reap [--dry-run]` | stops spend | Deletes gpu-ops machines more than 10 minutes past their deadline. |
@@ -60,7 +60,7 @@ When several things fail, 10 always wins. Otherwise the first failure is reporte
 
 ## JSON shapes
 
-Every command prints one object, which always has `ok` (bool) and `exit_code` (int). On failure it also has `error` (str).
+Every command prints one object, which always has `ok` (bool) and `exit_code` (int) — `schema` included, with the schema itself under `schema`. On failure it also has `error` (str). One function supplies those two keys for every command, so they cannot go missing.
 
 **`--get PATH[,PATH]` works on every command** and prints only those fields, as JSON, with or without `--json`.
 Use it instead of parsing the result yourself:
@@ -107,7 +107,7 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
   | `cost_estimate_usd` | Estimated cost of the run |
   | `teardown_confirmed` | **Must be true.** The provider confirmed the machine is gone |
   | `outputs_verified` | Outputs match their checksums |
-  | `outputs` | Each **declared** output and its size in bytes; a directory is `{"bytes": n, "files": n}` so the result cannot grow with the job's output. The files are in `outputs_dir` |
+  | `outputs` | Each **declared** output: a file's size in bytes, a directory as `{"bytes": n, "files": m}`. The result never grows with the number of files the job wrote. `bytes` is `null` when something could not be read, so `0` always means empty. The files are in `outputs_dir` |
   | `deadman` | `armed` or `unarmed` |
   | `notes` | Anything gpu-ops wants you to know (capacity fallback, a missing report file, …) |
   | `report` | **Look here first for the job's own results.** `null` when the spec has no `[report]` table |
@@ -122,7 +122,9 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
   - Per-file **input** hashes are not in the record at all; they are in `<run_dir>/inputs-manifest.json`.
   - Outputs land in `<run_dir>/out/<output path>`.
 - **`logs`:** `{"ok", "exit_code", "run_id", "path", "lines_in_file", "lines_matched", "lines": [...]}`.
-  Without `--json` it prints just the lines.
+  Without `--json` it prints just the lines. A `RUN_ID` that is not a run id is exit 2, and nothing is created.
+- **`spend --reconcile`:** adds `reconciled_now` (int) and `reconcile_skipped` (list of strings). A record it
+  cannot read is skipped and listed there; the report is still produced.
 - **`ps`:** `{"instances": [{"provider", "id", "name", "status", "deadline", "minutes_to_deadline", "age_minutes", "cost_so_far_usd", ...}]}`
 - **`spend`:** `total_usd`, `trailing_3mo_monthly_usd`, `overhead_share`, `rent_vs_buy{...}`, `by{month,provider,project,kind,gpu}`, `warning`.
 

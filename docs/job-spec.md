@@ -67,6 +67,8 @@ Every input file is hashed. The hashes are checked again on the machine after up
 
 - Only listed outputs come back, so large checkpoints you don't list are not downloaded.
 - Each file is hashed on the machine and checked after download (exit 7 on a mismatch).
+- Paths must be unique, and one output may not sit inside another (`lora` and `lora/adapter` is an
+  error): the run result reports a size per declared output, and overlapping ones would double-count.
 
 ### `[report]` (optional)
 
@@ -75,8 +77,11 @@ numbers without opening any file.
 
 | Key | Required | Meaning |
 |---|---|---|
-| `files` | yes | Paths under `$GPUOPS_OUT`. Each must also be listed in `[[outputs]]`, directly or inside an output directory. |
+| `files` | yes | Paths under `$GPUOPS_OUT`, at most 16. Each must also be listed in `[[outputs]]`, directly or inside an output directory. |
 | `max_bytes` | no | Per file, default 16384, hard maximum 65536. A larger file is truncated. |
+
+`files × max_bytes` must not exceed **256 KiB** — the whole table is bounded, not just each file in
+it, because the result is read by an agent that pays per byte.
 
 ```toml
 [report]

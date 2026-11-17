@@ -66,18 +66,50 @@ class Redactor:
         return text
 
     def scrub(self, obj: Any) -> Any:
-        """Redact every string inside a parsed structure, keys included.
+        """Redact every string *value* inside a parsed structure. Keys are left alone.
 
-        Applied at the boundaries where data leaves gpu-ops — the record on disk and the
-        result on stdout — so no caller has to remember to redact its own field.
+        Keys are never touched here because in gpu-ops' own structures they are the schema,
+        not data: a secret that happened to be `tier` or `cost` would rename the field and
+        either break the record or silently corrupt what `spend` reads. Where the keys really
+        are the job's data — a `[report]` file map — use `scrub_tree`.
         """
         if isinstance(obj, str):
             return self(obj)
         if isinstance(obj, dict):
-            return {(self(k) if isinstance(k, str) else k): self.scrub(v) for k, v in obj.items()}
+            return {k: self.scrub(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
             return [self.scrub(v) for v in obj]
         return obj
+
+    def scrub_tree(self, obj: Any) -> Any:
+        """Like `scrub`, but redacts keys too. For data whose keys the job chose."""
+        if isinstance(obj, dict):
+            return {(self(k) if isinstance(k, str) else k): self.scrub_tree(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self.scrub_tree(v) for v in obj]
+        return self(obj) if isinstance(obj, str) else obj
+
+    def scrub_record(self, record: Any) -> Any:
+        """Redact a run record field by field, according to each field's own policy.
+
+        The policy lives on the dataclass field (`metadata={"redact": …}`), so the question
+        "is this field redacted, and are its keys data or schema?" is answered once, where
+        the field is declared, instead of at each site that writes or prints a record.
+        Field *names* are never rewritten, and only named fields are set, so this cannot
+        invent a key or drop one.
+        """
+        import dataclasses
+
+        changes: dict[str, Any] = {}
+        for f in dataclasses.fields(record):
+            policy = f.metadata.get("redact", "none")
+            if policy == "none":
+                continue
+            value = getattr(record, f.name)
+            if value is None:
+                continue
+            changes[f.name] = self.scrub_tree(value) if policy == "keys+values" else self.scrub(value)
+        return dataclasses.replace(record, **changes) if changes else record
 
 
 def credential_script() -> Path:

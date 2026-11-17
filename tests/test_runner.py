@@ -329,14 +329,32 @@ def test_phase_markers_are_written_to_the_job_log(env: Path):
 
 
 def test_a_note_from_a_provider_error_is_redacted(env: Path):
-    """notes reach both record.json and the result, so they go through the same scrub."""
+    """notes reach record.json and the result, so they go through the same per-field scrub.
+
+    `list_raises` is what actually produces the `teardown error: {e!r}` note: teardown()
+    swallows its own exceptions, so terminate_failures never reaches that path.
+    """
     secret = "s3cr3t-value-123"
-    code, rec, prov, runner = run_job(env, secrets={"TOKEN": secret}, deadman=True,
-                                      provider_kw={"terminate_failures": 10_000},
-                                      command="echo hi > $GPUOPS_OUT/result.txt")
+    code, rec, prov, runner = run_job(env, secrets={"TOKEN": secret},
+                                      provider_kw={"fail_create": True, "list_raises": secret})
     assert code == ExitCode.TEARDOWN_FAILED
-    assert secret not in json.dumps(rec.notes)
+    assert any("teardown error" in n for n in rec.notes), rec.notes  # the note really happened
+    assert secret not in json.dumps(rec.notes) and "***" in json.dumps(rec.notes)
     assert secret not in (runner.run_dir / "record.json").read_text()
+
+
+def test_a_secret_that_looks_like_a_field_name_does_not_break_the_record(env: Path):
+    """Redaction is per field, so a secret can never rename one.
+
+    Scrubbing keys as well as values lost the record of a paid-for run (TypeError on
+    rebuild, after teardown) and silently wrote `***_estimate_usd` for a secret `cost`.
+    """
+    code, rec, prov, runner = run_job(env, secrets={"TOKEN": "tier", "OTHER": "cost"},
+                                      command="echo hi > $GPUOPS_OUT/result.txt")
+    assert code == ExitCode.OK, rec.error
+    saved = json.loads((runner.run_dir / "record.json").read_text())
+    assert saved["tier"] == "community" and saved["cost_estimate_usd"] is not None
+    assert not any("*" in k for k in saved)
 
 
 def test_report_read_when_a_spec_declares_no_outputs(env: Path):

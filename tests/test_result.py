@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from gpu_ops.errors import ExitCode, GpuOpsError
-from gpu_ops.result import PHASE_MARKER, compact, read_log, select, tail_lines
+from gpu_ops.errors import ExitCode, GpuOpsError  # noqa: F401
+from gpu_ops.result import PHASE_MARKER, compact, read_log, result, select, tail_lines
 
 RECORD = {
     "run_id": "20261116T120000-abcd", "status": "ok", "exit_code": 0, "error": None,
@@ -23,7 +23,7 @@ def test_compact_is_short_and_has_no_hashes(tmp_path: Path):
     out = tmp_path / "out"
     out.mkdir()
     (out / "result.txt").write_text("alpha\n")
-    res = compact(RECORD, tmp_path)
+    res = result(0, **compact(RECORD, tmp_path, ["result.txt"]))
     assert res["ok"] is True and res["exit_code"] == 0
     assert res["gpu"] == "RTX A5000" and res["minutes"] == 0.9
     assert res["outputs"] == {"result.txt": 6}
@@ -36,20 +36,28 @@ def test_compact_is_short_and_has_no_hashes(tmp_path: Path):
     assert len(json.dumps(res, indent=2).splitlines()) <= 25
 
 
+def test_result_supplies_ok_and_exit_code():
+    """Every command's result has them, because one function puts them there."""
+    assert result(0, a=1) == {"ok": True, "exit_code": 0, "a": 1}
+    assert result(ExitCode.TEARDOWN_FAILED)["ok"] is False
+    assert result(ExitCode.TEARDOWN_FAILED)["exit_code"] == 10
+
+
 def test_compact_names_multiple_gpus(tmp_path: Path):
-    assert compact({**RECORD, "gpu_count": 2}, tmp_path)["gpu"] == "RTX A5000 x2"
+    assert compact({**RECORD, "gpu_count": 2}, tmp_path, [])["gpu"] == "RTX A5000 x2"
 
 
 def test_compact_on_failure_carries_a_log_tail(tmp_path: Path):
     (tmp_path / "job.log").write_text("\n".join(f"line {i}" for i in range(50)) + "\n")
-    res = compact({**RECORD, "exit_code": 6, "status": "failed", "error": "command exited with code 3"}, tmp_path)
-    assert res["ok"] is False and res["error"] == "command exited with code 3"
+    res = compact({**RECORD, "exit_code": 6, "status": "failed",
+                   "error": "command exited with code 3"}, tmp_path, [])
+    assert res["error"] == "command exited with code 3"
     assert res["log_tail"][0] == "line 30" and len(res["log_tail"]) == 20
 
 
 def test_compact_report_is_null_until_a_spec_asks_for_one(tmp_path: Path):
-    assert compact(RECORD, tmp_path)["report"] is None
-    res = compact({**RECORD, "report": {"m.json": {"loss": 0.4}}}, tmp_path)
+    assert compact(RECORD, tmp_path, [])["report"] is None
+    res = compact({**RECORD, "report": {"m.json": {"loss": 0.4}}}, tmp_path, [])
     assert res["report"] == {"m.json": {"loss": 0.4}}
 
 
@@ -59,15 +67,16 @@ def test_compact_collapses_a_directory_output(tmp_path: Path):
     out.mkdir(parents=True)
     for i in range(50):
         (out / f"shard-{i}.bin").write_text("x" * 10)
-    manifest = {f"lora/shard-{i}.bin": "h" for i in range(50)}
-    res = compact({**RECORD, "outputs_manifest": manifest}, tmp_path, ["lora"])
-    assert res["outputs"] == {"lora": {"bytes": 500, "files": 50}}
-
     import json
-    assert len(json.dumps(res, indent=2).splitlines()) <= 25  # the budget holds on the worst case
+    manifest = {f"lora/shard-{i}.bin": "h" for i in range(50)}
+    res = result(0, **compact({**RECORD, "outputs_manifest": manifest}, tmp_path, ["lora"]))
+    assert res["outputs"] == {"lora": {"bytes": 500, "files": 50}}
+    assert len(json.dumps(res, indent=2).splitlines()) <= 25
 
-    # without the declared paths (a record read back without its spec) every file is listed
-    assert len(compact({**RECORD, "outputs_manifest": manifest}, tmp_path)["outputs"]) == 50
+    # the property that matters: the result's size does not grow with the job's output
+    huge = {f"lora/shard-{i}.bin": "h" for i in range(5000)}
+    res_huge = result(0, **compact({**RECORD, "outputs_manifest": huge}, tmp_path, ["lora"]))
+    assert len(json.dumps(res_huge, indent=2).splitlines()) == len(json.dumps(res, indent=2).splitlines())
 
 
 def test_compact_skips_an_optional_output_the_job_never_wrote(tmp_path: Path):
@@ -75,8 +84,8 @@ def test_compact_skips_an_optional_output_the_job_never_wrote(tmp_path: Path):
     assert list(res["outputs"]) == ["result.txt"]
 
 
-def test_compact_survives_a_run_that_never_started(tmp_path: Path):
-    res = compact({"run_id": "x", "status": "failed", "exit_code": 4, "error": "no offer"}, tmp_path)
+def test_compact_survives_a_run_that_never_started_without_a_spec(tmp_path: Path):
+    res = compact({"run_id": "x", "status": "failed", "exit_code": 4, "error": "no offer"}, tmp_path, [])
     assert res["gpu"] == "?" and res["minutes"] is None and res["outputs"] == {}
 
 
@@ -101,6 +110,20 @@ def test_select_backtracks_to_a_shorter_key():
     obj = {"a": {"b": {"c": 1}}, "a.b": {"z": 9}}
     assert select(obj, "a.b.c") == {"a.b.c": 1}
     assert select(obj, "a.b.z") == {"a.b.z": 9}
+
+
+def test_select_error_names_the_deepest_branch_not_the_last_tried():
+    """The search backtracks, so its failure context must travel with it."""
+    obj = {"a": {"x": 1}, "a.b": {"c": {"y": 1}}}
+    with pytest.raises(GpuOpsError) as e:
+        select(obj, "a.b.c.z")
+    assert "at 'a.b.c'" in e.value.message and "available: y" in e.value.message
+
+
+def test_select_error_on_a_list_names_the_list():
+    with pytest.raises(GpuOpsError) as e:
+        select({"instances": [{"id": "a"}]}, "instances.9.id")
+    assert "at 'instances'" in e.value.message and "indexes 0..0" in e.value.message
 
 
 def test_select_rejects_a_bogus_list_index_without_crashing():

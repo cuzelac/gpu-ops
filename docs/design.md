@@ -277,6 +277,21 @@ Each layer covers the failure of the one before it.
     extra tool calls. It is read only from outputs whose checksums matched.
   - `--get PATH[,PATH]` returns just the named fields, so an agent never writes a one-off JSON parser.
   - `gpu-ops logs RUN_ID [--tail N] [--grep REGEX] [--phase setup|command]` pulls only the log lines wanted.
+- **Two types carry the rules, because one function per rule was not enough.** A first attempt gave each
+  rule a single implementation and still produced defects at new sites: a scrubber called in three places,
+  a bound that was conditional on an argument, a guard around one statement of five. The rules now live on
+  the data they govern:
+  - **`RunRecord` declares its own redaction policy** per field (`metadata={"redact": "value" |
+    "keys+values" | "none"}`), and `Redactor.scrub_record` applies it with `dataclasses.replace`. Field
+    *names* are never rewritten — scrubbing keys renamed `cost_estimate_usd` for a secret `cost` and lost
+    the record of a paid-for run for a secret `tier`. Where keys really are the job's data (a `[report]`
+    map) the field says so.
+  - **`result.result(code, **fields)` supplies `ok` and `exit_code`** for every command, so the contract in
+    AGENTS.md holds by construction instead of by ten correct copies.
+  - **`cli._finish` owns everything after a command's real work** — building the result as well as printing
+    it — so no formatting, selection or file read can decide the exit code.
+  - **The spec makes the bad states unrepresentable:** `[[outputs]]` paths must be unique and
+    non-overlapping (so no file is counted twice), and `[report]`'s `files × max_bytes` is capped in total.
 - **Four rules each live in exactly one place,** because every site that re-derived one of them got it wrong:
   - **Nothing persisted or printed holds a secret.** `Redactor.scrub` runs over *parsed values* at the two
     boundaries — `Ledger._write` for the record on disk, `cmd_run` for the result on stdout. Redacting

@@ -51,21 +51,31 @@ class Ledger:
             os.fsync(f.fileno())
 
     def current(self) -> dict[str, dict]:
+        """The latest event per run. Streamed: ledger.jsonl is append-only and never truncated."""
         state: dict[str, dict] = {}
         if not self.path.exists():
             return state
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            state.setdefault(rec["run_id"], {}).update(rec)
+        with self.path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    state.setdefault(rec["run_id"], {}).update(rec)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue  # a torn last line, or an event from a version we do not know
         return state
 
     def run_dir(self, run_id: str) -> Path:
+        """Where a run's files live. Validates the id; creates nothing.
+
+        `gpu-ops logs` reaches this with a caller-supplied id, and a free, read-only
+        command must not leave an empty directory behind for an id that never ran.
+        """
         if not is_run_id(run_id):
             raise GpuOpsError(ExitCode.SPEC_INVALID, f"{run_id!r} is not a run id")
-        d = self.root / "runs" / run_id
+        return self.root / "runs" / run_id
+
+    def ensure_run_dir(self, run_id: str) -> Path:
+        d = self.run_dir(run_id)
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -79,6 +89,9 @@ class Ledger:
         return out
 
     def write_record(self, record: "RunRecord") -> Path:
+        """Persist a record, redacted per field. Field names are never rewritten."""
+        if self.redactor is not None:
+            record = self.redactor.scrub_record(record)
         return self._write(record.run_id, record.to_dict())
 
     def patch_record(self, run_id: str, **fields: Any) -> Path:
@@ -92,13 +105,11 @@ class Ledger:
         raw = {}
         if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
-        raw.update(fields)
+        raw.update(fields if self.redactor is None else self.redactor.scrub(fields))
         return self._write(run_id, raw)
 
     def _write(self, run_id: str, data: dict) -> Path:
-        if self.redactor is not None:
-            data = self.redactor.scrub(data)
-        p = self.run_dir(run_id) / "record.json"
+        p = self.ensure_run_dir(run_id) / "record.json"
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(p)
@@ -114,7 +125,7 @@ class RunRecord:
     spec_path: str
     status: str = "started"  # started | ok | failed
     exit_code: int | None = None
-    error: str | None = None
+    error: str | None = field(default=None, metadata={"redact": "value"})
     provider: str | None = None
     instance_id: str | None = None
     instance_name: str | None = None
@@ -140,8 +151,9 @@ class RunRecord:
     outputs_manifest: dict[str, str] = field(default_factory=dict)
     outputs_verified: bool | None = None
     teardown_confirmed: bool | None = None
-    notes: list[str] = field(default_factory=list)
-    report: dict | None = None  # [report] files from the spec; None when the spec asked for none
+    notes: list[str] = field(default_factory=list, metadata={"redact": "value"})
+    # the job chose these keys, so they are data and are redacted like any value
+    report: dict | None = field(default=None, metadata={"redact": "keys+values"})
 
     def to_dict(self) -> dict:
         return asdict(self)

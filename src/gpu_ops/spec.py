@@ -17,6 +17,9 @@ from .errors import ExitCode, GpuOpsError
 from .paths import to_local_path
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+# files x max_bytes: the run result is read by an agent that pays per byte, so the whole
+# [report] table is bounded, not only each file in it
+REPORT_BUDGET_BYTES = 256 * 1024
 
 
 class _Strict(BaseModel):
@@ -72,10 +75,10 @@ class OutputSpec(_Strict):
 
 class ReportSpec(_Strict):
     """Small output files whose contents come back inside the run result."""
-    files: list[str] = Field(default_factory=list,
+    files: list[str] = Field(default_factory=list, max_length=16,
                              description="Paths under $GPUOPS_OUT, each also listed in [[outputs]]. Their contents "
                                          "are included in the run result: a .json file as an object, anything else "
-                                         "as text.")
+                                         "as text. At most 16, and see REPORT_BUDGET_BYTES.")
     max_bytes: int = Field(default=16384, ge=1, le=65536,
                            description="Per file. A larger file is truncated, with \"truncated\": true.")
 
@@ -151,12 +154,22 @@ class JobSpec(_Strict):
         names = [i.name for i in self.inputs]
         if len(names) != len(set(names)):
             raise ValueError("input names must be unique")
+        paths = [o.path for o in self.outputs]
+        if len(paths) != len(set(paths)):
+            raise ValueError("[[outputs]] paths must be unique")
+        for a in paths:  # overlapping outputs would be counted twice in the run result
+            for b in paths:
+                if a != b and a.startswith(b + "/"):
+                    raise ValueError(f"output {a!r} is inside output {b!r}; list one or the other")
         if self.report:
-            outs = [o.path for o in self.outputs]
             for f in self.report.files:
-                if not any(f == o or f.startswith(o + "/") for o in outs):
+                if not any(f == o or f.startswith(o + "/") for o in paths):
                     raise ValueError(f"report.files entry {f!r} must also be listed in [[outputs]] "
-                                     f"(directly, or inside one of {outs})")
+                                     f"(directly, or inside one of {paths})")
+            budget = len(self.report.files) * self.report.max_bytes
+            if budget > REPORT_BUDGET_BYTES:
+                raise ValueError(f"[report] could put {budget} bytes in the run result; the limit is "
+                                 f"{REPORT_BUDGET_BYTES}. Lower max_bytes, or list fewer files")
         return self
 
 

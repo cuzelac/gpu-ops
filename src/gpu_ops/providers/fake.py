@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..remote import LocalRemote
+from ..names import PREFIX
 from .base import CreateRequest, Instance, Offer, SelfTerminate
 
 DEFAULT_OFFERS = [
@@ -32,7 +33,8 @@ class FakeProvider:
     name = "fake"
 
     def __init__(self, root: Path | None = None, *, offers: list[Offer] | None = None, fail_create: bool = False,
-                 terminate_failures: int = 0, deadman_armable: bool = True, no_capacity: set[tuple[str, str]] | None = None):
+                 terminate_failures: int = 0, deadman_armable: bool = True, no_capacity: set[tuple[str, str]] | None = None,
+                 list_raises: str | None = None):
         self.no_capacity = no_capacity or set()  # {(gpu_id, tier)} whose create fails like RunPod's "no instances available"
         self.root = Path(root or os.environ.get("GPUOPS_FAKE_ROOT") or tempfile.mkdtemp(prefix="gpuops-fake-"))
         self.root.mkdir(parents=True, exist_ok=True)
@@ -40,7 +42,8 @@ class FakeProvider:
         self.fail_create = fail_create
         self.terminate_failures = terminate_failures
         self.deadman_armable = deadman_armable
-        self.calls: list[str] = []
+        self.list_raises = list_raises  # message of a RuntimeError from list_instances, to exercise
+        self.calls: list[str] = []      # the teardown-bookkeeping error path in Runner._release
 
     # --- persistent state ---
     @property
@@ -90,6 +93,10 @@ class FakeProvider:
 
     def list_instances(self, prefix: str) -> list[Instance]:
         self.calls.append("list")
+        if self.list_raises and prefix not in ("", PREFIX):
+            # only the teardown lookup, which asks for one instance by full name; the planner
+            # and `ps` ask for the bare prefix and must keep working
+            raise RuntimeError(self.list_raises)
         return [self._to_instance(d) for d in self._load()["instances"].values()
                 if d["status"] != "terminated" and d["name"].startswith(prefix)]
 
