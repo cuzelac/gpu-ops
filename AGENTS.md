@@ -95,8 +95,9 @@ Every command prints one object, which always has `ok` (bool) and `exit_code` (i
   - `[gpu] min_vram_gb`
 - **What happens on the machine:**
   - Your command runs with bash in `$GPUOPS_WORK`.
-  - Inputs are under `$GPUOPS_IN/<input name>/`.
+  - Inputs are under `$GPUOPS_IN/<input name>/`. `include` may list files and directories.
   - Anything you want back must be written under `$GPUOPS_OUT` and listed in `[[outputs]]`.
+  - **`setup` lines share one shell; `command` runs in a new one.** Exports don't carry over, and a background server must be started in `command` (details: [docs/job-spec.md](docs/job-spec.md)).
 
 ## Known limits (v1)
 

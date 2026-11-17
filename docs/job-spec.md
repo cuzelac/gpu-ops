@@ -35,6 +35,10 @@ How `setup` and `command` run:
 - With bash and `set -euo pipefail`, in `$GPUOPS_WORK`.
 - These variables are set: `$GPUOPS_IN`, `$GPUOPS_OUT`, `$GPUOPS_WORK`, `$GPUOPS_RUN_ID`.
 - The deadline is enforced on the machine, and the command is killed at it (exit 8).
+- **All `setup` lines run in one shell, one after another. `command` then runs in a separate, new shell.** So:
+  - Variables you `export` in `setup` are **not** visible in `command`. Use `[env]`, or set them in `command`.
+  - **Start servers in `command`, not `setup`.** For a job that needs a background service (e.g. `ollama serve`), put the server start, its health check and the job itself in `command`, for example `ollama serve >$GPUOPS_WORK/ollama.log 2>&1 & until curl -sf localhost:11434; do sleep 1; done; ...`. A background process started in `setup` is not guaranteed to survive into `command`.
+- **`$GPUOPS_IN` is writable.** Inputs are verified right after upload, before `setup` runs, so changing them afterwards is harmless. Still prefer `$GPUOPS_WORK` for scratch files.
 
 ### `[env]`
 
@@ -54,7 +58,7 @@ How `setup` and `command` run:
 |---|---|---|
 | `name` | yes | Uploaded to `$GPUOPS_IN/<name>/`. |
 | `from` | yes | A local file or directory. |
-| `include` | no | Only these files, relative to `from`. Keeps unrelated files from being uploaded. |
+| `include` | no | Only these files **or directories** (directories are sent with everything beneath them), relative to `from`. Keeps unrelated files from being uploaded. |
 
 Every input file is hashed. The hashes are checked again on the machine after upload, and their combined hash is the run record's `inputs_hash`.
 
