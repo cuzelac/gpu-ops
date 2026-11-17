@@ -20,10 +20,11 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 
 ## Calling it
 
-- **In WSL:** `gpu-ops …`
-- **From Git Bash or PowerShell on Windows:** `C:\Users\cuzel\src\gpu-ops\bin\gpu-ops …` (or `bin\gpu-ops.ps1`).
-  - It runs the same command inside WSL, in the current directory.
-  - Spec paths may be relative, `/mnt/c/…` or `C:/…`.
+- **Anywhere:** just `gpu-ops …`.
+  - In WSL it's the real tool.
+  - In Git Bash and PowerShell on Windows, `C:\Users\cuzel\src\gpu-ops\bin` is on the user PATH; its wrappers (`gpu-ops`, `gpu-ops.ps1`) run the same command inside WSL, in the current directory.
+  - Spec paths may be relative, `/mnt/c/…`, `C:/…` or `C:\…`.
+- **If `gpu-ops` isn't found** (a session started before PATH was set), use the full path `C:\Users\cuzel\src\gpu-ops\bin\gpu-ops`.
 
 ## Commands
 

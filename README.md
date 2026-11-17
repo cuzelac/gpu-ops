@@ -34,7 +34,13 @@ gpu-ops init                     # writes ~/.config/gpu-ops/policy.toml and prov
 - `providers.toml` holds the 1Password reference to the RunPod key, never the key itself.
 - Out of the box, gpu-ops reads the key through the Windows 1Password app (`op.exe`), so 1Password may ask you to approve each command.
 
-From Windows (Git Bash or PowerShell), call `bin/gpu-ops` or `bin/gpu-ops.ps1`. They run the same command inside WSL.
+From Windows (Git Bash or PowerShell), add `C:\Users\cuzel\src\gpu-ops\bin` to your **user** PATH, then fully restart the Claude desktop app so new agent sessions pick it up:
+
+```powershell
+$p = [Environment]::GetEnvironmentVariable('Path', 'User'); [Environment]::SetEnvironmentVariable('Path', "$p;C:\Users\cuzel\src\gpu-ops\bin", 'User')
+```
+
+After that, `gpu-ops …` works in Git Bash and PowerShell. The wrappers in `bin/` run the same command inside WSL. Inside WSL they call the real tool by full path (`~/.local/bin/gpu-ops`), so the Windows PATH that WSL inherits can't make them call themselves.
 
 ## Running while you're away (no 1Password prompts)
 
@@ -155,7 +161,7 @@ powershell -ExecutionPolicy Bypass -File $t install     # (re)install
 | [docs/unattended.md](docs/unattended.md) | No 1Password prompts: service account + Windows Credential Manager |
 | [docs/glossary.md](docs/glossary.md) | One-line definitions |
 | [docs/research/2026-11-provider-comparison.md](docs/research/2026-11-provider-comparison.md) | Provider research and prices |
-| [docs/claude-settings-snippet.json](docs/claude-settings-snippet.json) | Permission rules for a calling project: free commands allowed, `run` asks you |
+| [docs/claude-settings-snippet.json](docs/claude-settings-snippet.json) | Permission rules to merge into `~/.claude/settings.json` (user-level, covers every project): all gpu-ops commands allowed, `run` asks you, `init` denied. Verified 2026-11-17 |
 
 ## Development
 

@@ -306,18 +306,18 @@ Each layer covers the failure of the one before it.
 - **A record on disk outlives the dataclass that wrote it.** `Ledger.patch_record` updates named fields in
   the raw JSON, so `spend --reconcile` cannot drop a key this version does not define.
 - **No interactive prompts anywhere.**
-- **Ask-rule snippet** (`docs/claude-settings-snippet.json`) for a calling project's `.claude/settings.json`:
-  - Allowed without asking: `schema`, `validate`, `plan`, `pin-image`, `logs`, `ps`, `spend`, `kill`, `reap`.
-  - Ask first: `run`.
-  - Free planning is its own command, `gpu-ops plan` (same as `run --dry-run`), because an ask rule for `gpu-ops run` would also catch `run --dry-run`.
-  - I show you the exact snippet before adding it to HS-AI-Coach.
+- **Spend gate** (`docs/claude-settings-snippet.json`), merged into the user-level `~/.claude/settings.json` so one copy covers every project. Verified 2026-11-17:
+  - Allow every `gpu-ops` command, by bare name and through the `bin/` wrappers.
+  - Ask for anything containing `gpu-ops run`. Ask rules take precedence over allow rules.
+  - Deny anything containing `gpu-ops init` (`init --force` would reset the policy).
+  - Free planning is its own command, `gpu-ops plan` (same as `run --dry-run`), because the ask rule also catches `run --dry-run`.
+  - Limits: ask rules don't apply in permission-bypass mode, and a command that reaches gpu-ops indirectly (via a script) isn't matched. The policy caps and prepaid balance still bound spend.
 - **MCP:** not in v1. The core is a library, so an MCP server would be a thin wrapper added later.
 - **Docs:**
   - `README.md`: what gpu-ops is, install, a 5-minute walkthrough.
   - `AGENTS.md`: commands, JSON shapes, exit codes, the policy, "always validate and dry-run first", "on exit 10 run `gpu-ops kill --all` and tell the human".
   - `docs/job-spec.md`: every field, with one example per job kind.
   - `docs/runbook.md`: how to find and kill anything billing, both with gpu-ops and in the RunPod console.
-  - `gpu-ops logs`: the job's own output after the fact, so the run itself does not have to print it.
   - `docs/glossary.md`: the terms above.
 
 ## 6. Spend tracking and rent vs buy

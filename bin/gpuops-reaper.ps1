@@ -48,7 +48,8 @@ if ($TestToast) {
 
 $reapArgs = if ($DryRun) { 'reap --json --dry-run' } else { 'reap --json' }
 # stdout = the JSON result; stderr goes to a WSL-side log so it can't corrupt the JSON
-$out = & wsl.exe -e bash -lc "gpu-ops $reapArgs 2>>~/.local/state/gpu-ops/reaper-stderr.log"
+# full path, not bare `gpu-ops`: WSL appends the Windows PATH, which may contain this bin folder
+$out = & wsl.exe -e bash -lc "~/.local/bin/gpu-ops $reapArgs 2>>~/.local/state/gpu-ops/reaper-stderr.log"
 $code = $LASTEXITCODE
 $text = ($out | Out-String).Trim()
 

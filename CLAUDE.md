@@ -2,11 +2,15 @@
 
 Users of the CLI (including agents running GPU jobs) read AGENTS.md; this file is for changing the code.
 
+## Where to work
+- `C:\Users\cuzel\src\gpu-ops` is the **live install**: the WSL `gpu-ops` command (editable `uv tool` install) and the scheduled reaper run its files directly. Keep it on a clean, pushed `main`; never edit or switch branches there.
+- Do all changes in a git worktree, one per branch: `git worktree add ../gpu-ops-wt/<branch> -b <branch> origin/main`; remove it after the PR merges (`git worktree remove`).
+
 ## Build & test
-- Code lives on the Windows side; run Python/tests inside WSL, with the venv off /mnt/c:
-  `MSYS_NO_PATHCONV=1 wsl -e bash -lc 'cd /mnt/c/Users/cuzel/src/gpu-ops && UV_PROJECT_ENVIRONMENT=$HOME/.cache/gpu-ops-venv uv run pytest'`
+- Code lives on the Windows side; run Python/tests inside WSL from your worktree, with a per-branch venv off /mnt/c:
+  `MSYS_NO_PATHCONV=1 wsl -e bash -lc 'cd /mnt/c/Users/cuzel/src/gpu-ops-wt/<branch> && UV_PROJECT_ENVIRONMENT=$HOME/.cache/gpu-ops-venv-<branch> uv run pytest'`
 - From Git Bash always set `MSYS_NO_PATHCONV=1` before `wsl`, or `/mnt/c/...` args get rewritten.
-- `gpu-ops` on the WSL PATH is an editable `uv tool` install of this repo; code edits apply immediately.
+- To try your branch's CLI without touching the installed one: `uv run gpu-ops …` inside your worktree (same `UV_PROJECT_ENVIRONMENT`).
 - Test new behaviour against the fake provider (`GPUOPS_ENABLE_FAKE=1`, `providers/fake.py`) + `LocalRemote`; see `tests/test_runner.py`.
 
 ## Rules

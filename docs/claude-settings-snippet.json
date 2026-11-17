@@ -1,24 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Bash(*gpu-ops schema*)",
-      "Bash(*gpu-ops validate *)",
-      "Bash(*gpu-ops plan *)",
-      "Bash(*gpu-ops pin-image *)",
-      "Bash(*gpu-ops logs *)",
-      "Bash(*gpu-ops ps*)",
-      "Bash(*gpu-ops spend*)",
-      "Bash(*gpu-ops kill *)",
-      "Bash(*gpu-ops reap*)"
+      "Bash(gpu-ops *)",
+      "Bash(/c/Users/cuzel/src/gpu-ops/bin/gpu-ops *)",
+      "Bash(C:/Users/cuzel/src/gpu-ops/bin/gpu-ops *)",
+      "PowerShell(C:\\Users\\cuzel\\src\\gpu-ops\\bin\\gpu-ops.ps1 *)",
+      "PowerShell(gpu-ops *)"
     ],
     "ask": [
-      "Bash(*gpu-ops run *)",
-      "PowerShell(*gpu-ops* run *)"
+      "Bash(*gpu-ops run*)",
+      "PowerShell(*gpu-ops* run*)"
     ],
     "deny": [
-      "Edit(~/.config/gpu-ops/**)",
-      "Write(~/.config/gpu-ops/**)",
-      "Bash(*gpu-ops init*)"
+      "Bash(*gpu-ops init*)",
+      "PowerShell(*gpu-ops* init*)"
     ]
   }
 }
