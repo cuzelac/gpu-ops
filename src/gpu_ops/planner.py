@@ -67,7 +67,9 @@ def month_spend(records: list[dict], now: datetime) -> float:
             continue
         t = datetime.fromisoformat(started)
         if (t.year, t.month) == (now.year, now.month):
-            total += r.get("cost_billed_usd") or r.get("cost_estimate_usd") or 0.0
+            # same rule as `gpu-ops spend`: billed > estimate > upper bound for runs killed before teardown
+            from .spend import _cost
+            total += _cost(r)
     return total
 
 

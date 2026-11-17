@@ -134,3 +134,12 @@ def test_select_fallback_note(env: Path):
     loaded = load_spec(write_spec(env, gpu='min_vram_gb = 16\nselect = "fastest"'))
     plan = make_plan(loaded.spec, load_policy(), {"fake": FakeProvider()}, [])
     assert any("fell back to cheapest-hour" in n for n in plan.notes)
+
+
+def test_month_spend_counts_killed_runs_like_spend():
+    now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    killed = {"started_at": "2026-11-12T14:13:24+00:00", "deadline": "2026-11-12T14:16:24+00:00",
+              "instance_id": "k", "price_per_hr": 0.20}
+    finished = {"started_at": "2026-11-12T10:00:00+00:00", "ended_at": "2026-11-12T10:10:00+00:00",
+                "instance_id": "f", "cost_estimate_usd": 0.05}
+    assert month_spend([killed, finished], now) == pytest.approx(0.01 + 0.05, abs=1e-6)
