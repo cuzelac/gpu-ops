@@ -4,7 +4,8 @@
       "Bash(gpu-ops *)",
       "Bash(/c/Users/cuzel/src/gpu-ops/bin/gpu-ops *)",
       "Bash(C:/Users/cuzel/src/gpu-ops/bin/gpu-ops *)",
-      "PowerShell(C:\\Users\\cuzel\\src\\gpu-ops\\bin\\gpu-ops.ps1 *)"
+      "PowerShell(C:\\Users\\cuzel\\src\\gpu-ops\\bin\\gpu-ops.ps1 *)",
+      "PowerShell(gpu-ops *)"
     ],
     "ask": [
       "Bash(*gpu-ops run*)",
