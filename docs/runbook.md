@@ -33,10 +33,25 @@ For example, 1Password won't unlock or WSL is broken:
 
 - **Keep the RunPod balance small and leave auto-pay off.** When the balance reaches $0, RunPod stops every pod, so the worst case is losing that balance.
 
-## Where things are (inside WSL)
+## 5. If the reaper sent a notification
+
+- **"N machine(s) … deleted":**
+  - The run that started them didn't clean up, and neither did its dead-man timer. Find the run in `gpu-ops spend` / `~/.local/state/gpu-ops/runs/` and look at its `record.json` and `job.log`.
+  - Then run `gpu-ops ps` to confirm nothing is left.
+- **"reaper FAILED (exit 3)":**
+  - It couldn't read the RunPod key. Check the service account with `bin\gpuops-credential.ps1 test` and [docs/unattended.md](unattended.md).
+  - Until it's fixed, check `gpu-ops ps` yourself.
+- **Any other failure:**
+  - Run `gpu-ops ps`, and use the console (step 2) if gpu-ops can't reach RunPod.
+  - The log says what happened: `C:\Users\cuzel\AppData\Local\gpu-ops\reaper.log`. From a Claude Code desktop session, read it via WSL; see README, "Scheduled reaper".
+
+## Where things are
 
 | What | Where |
 |---|---|
-| Policy and provider settings | `~/.config/gpu-ops/policy.toml`, `~/.config/gpu-ops/providers.toml` |
-| Run records, logs, outputs | `~/.local/state/gpu-ops/runs/<run-id>/` |
-| Ledger | `~/.local/state/gpu-ops/ledger.jsonl` |
+| Policy and provider settings (WSL) | `~/.config/gpu-ops/policy.toml`, `~/.config/gpu-ops/providers.toml` |
+| Run records, logs, outputs (WSL) | `~/.local/state/gpu-ops/runs/<run-id>/` |
+| Ledger (WSL) | `~/.local/state/gpu-ops/ledger.jsonl` |
+| Reaper log (Windows) | `C:\Users\cuzel\AppData\Local\gpu-ops\reaper.log` |
+| Reaper errors from inside WSL | `~/.local/state/gpu-ops/reaper-stderr.log` |
+| Reaper task | Task Scheduler → `gpu-ops` folder → `gpu-ops reaper` |

@@ -227,8 +227,8 @@ Each layer covers the failure of the one before it.
 | 1 | Pre-flight cost check against spec, policy per-job and policy monthly caps | Over-budget jobs never start | Design |
 | 2 | `try/finally` teardown plus signal handlers | Job fails, script errors, Ctrl-C | Design |
 | 3 | Ledger written before create; deadline encoded in the name | Script killed mid-create | Design |
-| 4 | Dead-man timer on the instance | PC off, asleep or crashed | **Unverified**: depends on RunPod injecting a key. Proved or disproved by the kill test |
-| 5 | Scheduled reaper every 30 min (Windows Task Scheduler → WSL → `gpu-ops reap`) | Layer 4 unarmed, and the PC wakes up later | Default yes; I install it only after you approve |
+| 4 | Dead-man timer on the instance | PC off, asleep or crashed | **Verified 2026-11-12** in the kill test |
+| 5 | Scheduled reaper every 30 min (Windows Task Scheduler → WSL → `gpu-ops reap`) | Layer 4 unarmed, and the PC wakes up later | **Installed 2026-11-16** (`bin/gpuops-reaper-task.ps1`); runs only while logged on |
 | 6 | `gpu-ops ps` and `gpu-ops kill --all` ask the provider directly, not just the ledger | Any leftover | Design |
 | 7 | Prepaid balance with auto-pay off | Everything above failing | You set this in the RunPod console |
 

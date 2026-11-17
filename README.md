@@ -16,6 +16,7 @@ Rent a cloud GPU, run a job, bring the results home, and shut it down. Every tim
 | Kill test | **Passed 2026-11-12.** Two jobs; both gpu-ops processes killed with `kill -9` mid-command. Job A's dead-man timer deleted it on its own (gone 15 s after its deadline); `kill --all` deleted job B; 0 pods left |
 | Dead-man timer on RunPod | **Works.** RunPod injects `RUNPOD_POD_ID`/`RUNPOD_API_KEY`; the fix was saving them at boot, because SSH sessions don't inherit the container's environment |
 | `reap` deleting a real machine | Not exercised live (the dead-man got there first). Same teardown code as `kill`, plus unit tests |
+| Scheduled reaper (Windows Task Scheduler) | **Installed and running 2026-11-16.** Every 30 min while you're logged on, hidden; first scheduled pass 16:50 succeeded. Failure notification tested |
 | `spend --reconcile` against RunPod billing | Not verified: RunPod returned no billing records for these runs yet (lag?) |
 | Unattended 1Password access (service account) | **Verified 2026-11-16.** `ps` and `plan` read the RunPod key from the `gpu-ops` vault with the desktop-app route disabled; no prompt, ~4.6 s per command |
 | HS-AI-Coach QLoRA job | Not run yet. Needs your OK, because it spends money |
@@ -68,6 +69,35 @@ The fix is a **1Password service account**: a non-human 1Password identity that 
 - **Skip it for one command:** `GPUOPS_NO_SERVICE_ACCOUNT=1 gpu-ops …`
 
 Full detail, including rate limits: [docs/unattended.md](docs/unattended.md).
+
+## Scheduled reaper
+
+A Windows scheduled task, `\gpu-ops\gpu-ops reaper`, runs `gpu-ops reap` every 30 minutes. It deletes any `gpuops-…` machine more than 10 minutes past the deadline in its name. It's the backstop for when both a run's own teardown and the on-machine dead-man timer fail.
+
+**How it runs**
+- **As you, only while you're logged on.** That's how it reaches the service-account token without Task Scheduler storing your Windows password. While you're logged off, the dead-man timer is the guard.
+- **Hidden** (`conhost --headless`), so no window appears.
+- **One copy at a time,** stopped after 10 minutes. It runs on battery, and catches up after sleep.
+- **Quiet unless something happens:** it shows a **Windows notification** only if it deleted something or failed. They appear under "Windows PowerShell".
+
+**Managing it** (in PowerShell):
+
+```powershell
+$t = 'C:\Users\cuzel\src\gpu-ops\bin\gpuops-reaper-task.ps1'
+powershell -ExecutionPolicy Bypass -File $t status      # last run, result (0 = ok), next run
+powershell -ExecutionPolicy Bypass -File $t show        # exactly what install registers
+powershell -ExecutionPolicy Bypass -File $t uninstall   # remove it
+powershell -ExecutionPolicy Bypass -File $t install     # (re)install
+```
+
+**Doing a pass by hand:** `bin\gpuops-reaper.ps1`. Add `-DryRun` to only report, or `-TestToast` to check that notifications reach you.
+
+**Log:** `C:\Users\cuzel\AppData\Local\gpu-ops\reaper.log`, one line per pass, last 2000 kept.
+
+> **If you read the log from a Claude Code desktop session, read it through WSL:**
+> `cat /mnt/c/Users/cuzel/AppData/Local/gpu-ops/reaper.log`
+>
+> The desktop app runs as a packaged (MSIX) app. When a process inside it writes under `AppData\Local`, Windows redirects the write to a private copy (`AppData\Local\Packages\Claude_…\LocalCache\Local\…`). Once that copy exists, the session sees it instead of the real file. File Explorer, a normal terminal and WSL all see the real file.
 
 ## Five-minute walkthrough
 
