@@ -8,6 +8,7 @@ later without a rewrite.
 
 from __future__ import annotations
 
+import json
 import shlex
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from .planner import Plan
 from .policy import Policy
 from .providers.base import CreateRequest, Instance, Provider
 from .remote import TIMEOUT_EXIT, Remote, TransferError
+from .result import PHASE_MARKER
 from .secrets import Redactor
 from .spec import LoadedSpec
 
@@ -73,12 +75,14 @@ def _dq(value: str) -> str:
 class Runner:
     def __init__(self, loaded: LoadedSpec, plan: Plan, policy: Policy, provider: Provider, ledger: Ledger,
                  remote_factory: RemoteFactory, redactor: Redactor, secrets: dict[str, str],
-                 opts: RunOptions | None = None, log: Log | None = None):
+                 opts: RunOptions | None = None, log: Log | None = None, job_log: Log | None = None):
         self.loaded, self.spec, self.plan, self.policy = loaded, loaded.spec, plan, policy
         self.provider, self.ledger, self.remote_factory = provider, ledger, remote_factory
         self.redact, self.secrets = redactor, secrets
         self.opts = opts or RunOptions()
-        self.log = log or (lambda s: None)
+        self.log = log or (lambda s: None)  # phase lines
+        self.job_log = job_log or (lambda s: None)  # echo of the job's output; job.log is written either way
+        self.inputs_manifest: dict[str, str] = {}  # kept off the record: see ledger's module docstring
 
         self.run_id = new_run_id()
         self.started = _utc()
@@ -121,11 +125,14 @@ class Runner:
         finally:
             self.record.phases[name] = round(self.record.phases.get(name, 0) + time.monotonic() - t0, 2)
 
-    def _job_log(self, line: str) -> None:
-        line = self.redact(line)
+    def _write_log(self, line: str) -> None:
         with (self.run_dir / "job.log").open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-        self.log("  | " + line)
+
+    def _job_log(self, line: str) -> None:
+        line = self.redact(line)
+        self._write_log(line)
+        self.job_log(line)
 
     def _prelude(self) -> str:
         r = self.opts.remote_root if not self.remote else self.remote.root
@@ -170,6 +177,8 @@ class Runner:
             code = worst(code, self._release())
         self.record.exit_code = int(code)
         self.record.status = "ok" if code == ExitCode.OK else "failed"
+        if self.spec.report is not None and self.record.report is None:
+            self.record.notes.append("report omitted: the outputs were not downloaded and verified")
         if self.record.error:
             self.record.error = self.redact(self.record.error)
         self.ledger.write_record(self.record)
@@ -184,8 +193,11 @@ class Runner:
             else:
                 m = build_manifest(local, inp.include or None)
             full.update({f"{inp.name}/{k}": v for k, v in m.items()})
-        self.record.inputs_manifest = full
+        self.inputs_manifest = full
         self.record.inputs_hash = manifest_digest(full)
+        self.record.inputs_file_count = len(full)
+        (self.run_dir / "inputs-manifest.json").write_text(json.dumps(full, indent=2, sort_keys=True),
+                                                           encoding="utf-8")
 
     def _acquire(self) -> None:
         with self._phase("provision"):
@@ -301,12 +313,12 @@ class Runner:
         with self._phase("upload"):
             for inp in self.spec.inputs:
                 remote.put(self.loaded.input_paths[inp.name], f"in/{inp.name}", inp.include or None)
-            if self.record.inputs_manifest:
+            if self.inputs_manifest:
                 out: list[str] = []
-                rels = sorted({k.split("/", 1)[0] for k in self.record.inputs_manifest})
+                rels = sorted({k.split("/", 1)[0] for k in self.inputs_manifest})
                 remote.run(remote_manifest_script(remote.root + "/in", rels), timeout_s=600, on_line=out.append)
                 got, _ = parse_sha256sum("\n".join(out))
-                problems = compare(self.record.inputs_manifest, got)
+                problems = compare(self.inputs_manifest, got)
                 if problems:
                     raise GpuOpsError(ExitCode.TRANSFER_FAILED, "upload verification failed: " + "; ".join(problems[:5]))
 
@@ -314,6 +326,7 @@ class Runner:
             if not lines:
                 continue
             with self._phase(phase):
+                self._write_log(PHASE_MARKER + phase)  # so `gpu-ops logs --phase` can split the log
                 budget = self._remaining(reserve=True)
                 if budget <= 0:
                     raise GpuOpsError(ExitCode.CAP_HIT, f"no time left for {phase}")
@@ -351,6 +364,37 @@ class Runner:
             raise GpuOpsError(ExitCode.TRANSFER_FAILED, "output verification failed: " + "; ".join(problems[:5]))
         if required_missing:
             raise GpuOpsError(ExitCode.JOB_FAILED, f"required outputs missing: {required_missing}")
+        self._read_report(local_out)
+
+    def _read_report(self, local_out: Path) -> None:
+        """Include the spec's [report] files in the record, read from the verified local copies.
+
+        Only ever called once the outputs are downloaded and their checksums match, so what
+        reaches the result is data gpu-ops has verified.
+        """
+        rs = self.spec.report
+        if rs is None:
+            return
+        report: dict = {}
+        for rel in rs.files:
+            path = local_out / rel
+            if not path.is_file():
+                report[rel] = None
+                self.record.notes.append(f"report file missing from the outputs: {rel}")
+                continue
+            size = path.stat().st_size
+            text = self.redact(path.read_bytes()[:rs.max_bytes].decode("utf-8", "replace"))
+            if size > rs.max_bytes:
+                report[rel] = {"truncated": True, "bytes": size, "text": text}
+                continue
+            if path.suffix.lower() == ".json":
+                try:
+                    report[rel] = json.loads(text)
+                except json.JSONDecodeError as e:
+                    report[rel] = {"text": text, "parse_error": str(e)}
+                continue
+            report[rel] = {"text": text}
+        self.record.report = report
 
     def _release(self) -> ExitCode:
         ok = False

@@ -60,11 +60,123 @@ def test_missing_policy_refuses(env: Path):
 
 
 def test_full_run_via_cli(env: Path):
-    r = cli("run", str(write_spec(env)), "--json", "--quiet")
+    r = cli("run", str(write_spec(env)), "--json", "--quiet")  # --quiet still accepted
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
-    assert out["record"]["outputs_verified"] is True
+    assert out["outputs_verified"] is True
     assert FakeProvider(env / "fake").list_instances(PREFIX) == []
+
+
+COMPACT_FIELDS = {"ok", "exit_code", "run_id", "status", "error", "gpu", "tier", "price_per_hr", "minutes",
+                  "cost_estimate_usd", "teardown_confirmed", "outputs_verified", "outputs_dir", "outputs",
+                  "deadman", "notes"}
+
+
+def test_run_json_is_compact_by_default(env: Path):
+    r = cli("run", str(write_spec(env)), "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert set(out) == COMPACT_FIELDS  # no record, no manifests, no phase timings
+    assert out["outputs"] == {"result.txt": 3} and out["minutes"] is not None
+    assert len(r.stdout.splitlines()) <= 25  # an agent pays for every line of this
+    assert "sha256" not in r.stdout and len(json.dumps(out)) < 1200
+
+
+def test_run_full_keeps_the_whole_record(env: Path):
+    r = cli("run", str(write_spec(env)), "--json", "--full")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert set(out) == {"ok", "exit_code", "run_id", "run_dir", "record"}
+    rec = out["record"]
+    assert rec["outputs_manifest"] and rec["phases"] and rec["inputs_file_count"] == 2
+    assert "inputs_manifest" not in rec  # it has its own file now
+    manifest = json.loads((Path(out["run_dir"]) / "inputs-manifest.json").read_text())
+    assert set(manifest) == {"data/a.txt", "data/sub/b.txt"}
+
+
+def test_run_is_silent_on_stderr_without_a_tty_or_flags(env: Path):
+    r = cli("run", str(write_spec(env)), "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stderr == "", r.stderr
+
+
+def test_progress_streams_phases_and_job_output(env: Path):
+    r = cli("run", str(write_spec(env, command="echo from-the-job > $GPUOPS_OUT/result.txt; echo hello-stderr")),
+            "--json", "--progress")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[provision]" in r.stderr and "  | hello-stderr" in r.stderr
+
+
+def test_failed_run_carries_a_log_tail(env: Path):
+    r = cli("run", str(write_spec(env, command="echo about-to-fail; exit 3")), "--json")
+    assert r.returncode == ExitCode.JOB_FAILED
+    out = json.loads(r.stdout)
+    assert out["ok"] is False and "exited with code 3" in out["error"]
+    assert "about-to-fail" in out["log_tail"]
+
+
+# ---------------- --get ----------------
+
+def test_get_selects_fields_on_plan(env: Path):
+    r = cli("plan", str(write_spec(env)), "--get", "plan.offer.price_per_hr,plan.worst_case_usd")
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert set(got) == {"plan.offer.price_per_hr", "plan.worst_case_usd"}
+    assert got["plan.offer.price_per_hr"] == 0.20
+
+
+def test_get_works_on_run_ps_and_spend(env: Path):
+    r = cli("run", str(write_spec(env)), "--get", "exit_code,cost_estimate_usd,outputs.result.txt")
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert got["exit_code"] == 0 and got["outputs.result.txt"] == 3
+
+    r = cli("ps", "--get", "instances")
+    assert r.returncode == 0 and json.loads(r.stdout) == {"instances": []}
+
+    r = cli("spend", "--get", "total_usd,runs")
+    assert r.returncode == 0 and json.loads(r.stdout)["runs"] == 1
+
+
+def test_get_on_a_missing_path_is_exit_2(env: Path):
+    r = cli("plan", str(write_spec(env)), "--get", "plan.offer.nope")
+    assert r.returncode == ExitCode.SPEC_INVALID
+    assert json.loads(r.stdout)["exit_code"] == 2
+    assert "price_per_hr" in json.loads(r.stdout)["error"]  # says what is available
+
+
+# ---------------- logs ----------------
+
+def test_logs_tail_grep_and_phase(env: Path):
+    spec = write_spec(env, setup="echo setting-up; echo ERROR: in-setup",
+                      command="echo line-one; echo ERROR: boom; echo line-three; echo hi > $GPUOPS_OUT/result.txt")
+    r = cli("run", str(spec), "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    run_id = json.loads(r.stdout)["run_id"]
+
+    r = cli("logs", run_id, "--tail", "5", "--grep", "ERROR", "--json")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["lines"] == ["ERROR: in-setup", "ERROR: boom"] and out["lines_matched"] == 2
+
+    r = cli("logs", run_id, "--tail", "1", "--grep", "ERROR", "--json")
+    assert json.loads(r.stdout)["lines"] == ["ERROR: boom"]
+
+    r = cli("logs", run_id, "--phase", "setup", "--json")
+    assert json.loads(r.stdout)["lines"] == ["setting-up", "ERROR: in-setup"]
+
+    r = cli("logs", run_id, "--phase", "command", "--get", "lines.0")
+    assert json.loads(r.stdout) == {"lines.0": "line-one"}
+
+    r = cli("logs", run_id, "--tail", "2")  # human output is just the lines
+    assert r.stdout.splitlines() == ["ERROR: boom", "line-three"]
+
+
+def test_logs_for_an_unknown_run_is_exit_2(env: Path):
+    r = cli("logs", "nope-not-a-run", "--json")
+    assert r.returncode == ExitCode.SPEC_INVALID
+    assert "no job log" in json.loads(r.stdout)["error"]
+
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
@@ -85,7 +197,7 @@ def test_signal_mid_run_tears_down(env: Path, sig):
     p.send_signal(sig)
     stdout, stderr = p.communicate(timeout=60)
     assert p.returncode == ExitCode.JOB_FAILED, stdout + stderr
-    assert "interrupted" in json.loads(stdout)["record"]["error"]
+    assert "interrupted" in json.loads(stdout)["error"]
     assert FakeProvider(env / "fake").list_instances(PREFIX) == []
 
 

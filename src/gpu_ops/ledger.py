@@ -4,7 +4,9 @@ state_dir/
   ledger.jsonl            append-only events; the last event per run_id is its current state
   runs/<run-id>/
     record.json           the run record (written at the end, and updated by `spend --reconcile`)
-    job.log               setup + command output, secrets redacted
+    inputs-manifest.json  every uploaded input file and its sha256 (kept out of record.json: a
+                          large dataset would swamp it; the record keeps the digest and the count)
+    job.log               setup + command output, secrets redacted, with phase markers
     out/                  outputs brought back
 
 The ledger is a convenience for reports. Safety never depends on it: `ps`, `kill`
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as _fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -107,12 +109,19 @@ class RunRecord:
     deadline: str | None = None
     deadman: str | None = None  # armed | unarmed | n/a
     phases: dict[str, float] = field(default_factory=dict)  # seconds per phase
-    inputs_hash: str | None = None
-    inputs_manifest: dict[str, str] = field(default_factory=dict)
+    inputs_hash: str | None = None  # one digest over the whole inputs manifest
+    inputs_file_count: int | None = None
     outputs_manifest: dict[str, str] = field(default_factory=dict)
     outputs_verified: bool | None = None
     teardown_confirmed: bool | None = None
     notes: list[str] = field(default_factory=list)
+    report: dict | None = None  # [report] files from the spec; None when the spec asked for none
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RunRecord":
+        """Read a record written by any version: fields this one does not know are dropped."""
+        known = {f.name for f in _fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})

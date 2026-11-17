@@ -143,3 +143,24 @@ def test_month_spend_counts_killed_runs_like_spend():
     finished = {"started_at": "2026-11-12T10:00:00+00:00", "ended_at": "2026-11-12T10:10:00+00:00",
                 "instance_id": "f", "cost_estimate_usd": 0.05}
     assert month_spend([killed, finished], now) == pytest.approx(0.01 + 0.05, abs=1e-6)
+
+
+def test_report_file_must_also_be_an_output(env: Path):
+    spec = write_spec(env, extra='[report]\nfiles = ["metrics.json"]\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert e.value.code == ExitCode.SPEC_INVALID and "must also be listed in [[outputs]]" in e.value.message
+
+
+def test_report_max_bytes_is_capped(env: Path):
+    spec = write_spec(env, outputs='[[outputs]]\npath = "result.txt"\n',
+                      extra='[report]\nfiles = ["result.txt"]\nmax_bytes = 999999\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert e.value.code == ExitCode.SPEC_INVALID
+
+
+def test_report_defaults(env: Path):
+    loaded = load_spec(write_spec(env, outputs='[[outputs]]\npath = "result.txt"\n',
+                                  extra='[report]\nfiles = ["result.txt"]\n'))
+    assert loaded.spec.report.max_bytes == 16384

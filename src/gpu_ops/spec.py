@@ -70,6 +70,25 @@ class OutputSpec(_Strict):
         return v.strip("/")
 
 
+class ReportSpec(_Strict):
+    """Small output files whose contents come back inside the run result."""
+    files: list[str] = Field(default_factory=list,
+                             description="Paths under $GPUOPS_OUT, each also listed in [[outputs]]. Their contents "
+                                         "are included in the run result: a .json file as an object, anything else "
+                                         "as text.")
+    max_bytes: int = Field(default=16384, ge=1, le=65536,
+                           description="Per file. A larger file is truncated, with \"truncated\": true.")
+
+    @field_validator("files")
+    @classmethod
+    def _relative(cls, v: list[str]) -> list[str]:
+        for item in v:
+            p = Path(item)
+            if p.is_absolute() or ".." in p.parts or item.strip() in ("", "."):
+                raise ValueError("report file must be a relative path under $GPUOPS_OUT, without '..'")
+        return [item.strip("/") for item in v]
+
+
 class GpuSpec(_Strict):
     min_vram_gb: int = Field(ge=1, description="Minimum VRAM per GPU. A floor, not a target.")
     count: int = Field(default=1, ge=1, le=8)
@@ -99,6 +118,8 @@ class JobSpec(_Strict):
                                                                   "$GPUOPS_IN etc. are expanded.")
     inputs: list[InputSpec] = Field(default_factory=list)
     outputs: list[OutputSpec] = Field(default_factory=list)
+    report: ReportSpec | None = Field(default=None, description="Optional: output files to include in the run result, "
+                                                                 "so the caller sees the job's own metrics.")
     gpu: GpuSpec
     limits: LimitsSpec
     secrets: dict[str, str] = Field(default_factory=dict, description="NAME = \"op://vault/item/field\". Read at run "
@@ -130,6 +151,12 @@ class JobSpec(_Strict):
         names = [i.name for i in self.inputs]
         if len(names) != len(set(names)):
             raise ValueError("input names must be unique")
+        if self.report:
+            outs = [o.path for o in self.outputs]
+            for f in self.report.files:
+                if not any(f == o or f.startswith(o + "/") for o in outs):
+                    raise ValueError(f"report.files entry {f!r} must also be listed in [[outputs]] "
+                                     f"(directly, or inside one of {outs})")
         return self
 
 
