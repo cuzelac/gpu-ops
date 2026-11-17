@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from .errors import ExitCode, GpuOpsError
 
@@ -42,7 +43,15 @@ def op_binary() -> str:
 
 
 class Redactor:
-    """Replaces every known secret value with *** in any text it sees."""
+    """Replaces every known secret value with *** in any text or parsed value it sees.
+
+    Two limits, both deliberate and both the reason `scrub` exists:
+    - A value shorter than 4 characters is not registered; it would match everywhere.
+    - Matching is literal, so a secret only matches text that holds it verbatim. A secret
+      spanning two lines never matches a line-by-line log, and one containing a quote or
+      backslash does not match its own JSON-escaped form. So redact *parsed values* with
+      `scrub` wherever the data is structured, and keep `__call__` for raw log lines.
+    """
 
     def __init__(self) -> None:
         self._values: set[str] = set()
@@ -55,6 +64,20 @@ class Redactor:
         for v in sorted(self._values, key=len, reverse=True):
             text = text.replace(v, "***")
         return text
+
+    def scrub(self, obj: Any) -> Any:
+        """Redact every string inside a parsed structure, keys included.
+
+        Applied at the boundaries where data leaves gpu-ops — the record on disk and the
+        result on stdout — so no caller has to remember to redact its own field.
+        """
+        if isinstance(obj, str):
+            return self(obj)
+        if isinstance(obj, dict):
+            return {(self(k) if isinstance(k, str) else k): self.scrub(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self.scrub(v) for v in obj]
+        return obj
 
 
 def credential_script() -> Path:
@@ -124,7 +147,7 @@ def read_op(ref: str, redactor: Redactor | None = None) -> str:
             why = ((r.stderr or "").strip().splitlines() or ["unknown error"])[-1]
         except subprocess.TimeoutExpired:
             why = "timed out after 60 s"
-        why = why.replace(token, "***")
+        why = redactor(why) if redactor is not None else why.replace(token, "***")
         print(f"gpu-ops: service account could not read {ref} ({why}); falling back to the 1Password app",
               file=sys.stderr)
 

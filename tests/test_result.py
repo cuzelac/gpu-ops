@@ -28,7 +28,8 @@ def test_compact_is_short_and_has_no_hashes(tmp_path: Path):
     assert res["gpu"] == "RTX A5000" and res["minutes"] == 0.9
     assert res["outputs"] == {"result.txt": 6}
     assert res["outputs_dir"] == str(out)
-    assert "report" not in res and "log_tail" not in res  # neither asked for, nothing failed
+    # the key set never varies: report is null when the spec asked for none, log_tail when ok
+    assert res["report"] is None and res["log_tail"] is None
     assert "a" * 64 not in str(res) and "inputs_file_count" not in res
 
     import json
@@ -46,10 +47,32 @@ def test_compact_on_failure_carries_a_log_tail(tmp_path: Path):
     assert res["log_tail"][0] == "line 30" and len(res["log_tail"]) == 20
 
 
-def test_compact_includes_report_only_when_asked_for(tmp_path: Path):
-    assert "report" not in compact(RECORD, tmp_path)
+def test_compact_report_is_null_until_a_spec_asks_for_one(tmp_path: Path):
+    assert compact(RECORD, tmp_path)["report"] is None
     res = compact({**RECORD, "report": {"m.json": {"loss": 0.4}}}, tmp_path)
     assert res["report"] == {"m.json": {"loss": 0.4}}
+
+
+def test_compact_collapses_a_directory_output(tmp_path: Path):
+    """A declared directory output is one entry, however many files it holds."""
+    out = tmp_path / "out" / "lora"
+    out.mkdir(parents=True)
+    for i in range(50):
+        (out / f"shard-{i}.bin").write_text("x" * 10)
+    manifest = {f"lora/shard-{i}.bin": "h" for i in range(50)}
+    res = compact({**RECORD, "outputs_manifest": manifest}, tmp_path, ["lora"])
+    assert res["outputs"] == {"lora": {"bytes": 500, "files": 50}}
+
+    import json
+    assert len(json.dumps(res, indent=2).splitlines()) <= 25  # the budget holds on the worst case
+
+    # without the declared paths (a record read back without its spec) every file is listed
+    assert len(compact({**RECORD, "outputs_manifest": manifest}, tmp_path)["outputs"]) == 50
+
+
+def test_compact_skips_an_optional_output_the_job_never_wrote(tmp_path: Path):
+    res = compact(RECORD, tmp_path, ["result.txt", "maybe.json"])
+    assert list(res["outputs"]) == ["result.txt"]
 
 
 def test_compact_survives_a_run_that_never_started(tmp_path: Path):
@@ -71,6 +94,20 @@ RESULT = {"ok": True, "plan": {"offer": {"price_per_hr": 0.16}, "worst_case_usd"
 def test_select_reads_nested_paths():
     got = select(RESULT, "plan.offer.price_per_hr,plan.worst_case_usd")
     assert got == {"plan.offer.price_per_hr": 0.16, "plan.worst_case_usd": 0.05}
+
+
+def test_select_backtracks_to_a_shorter_key():
+    """Longest-prefix-wins must fall back, or a path that exists reads as missing."""
+    obj = {"a": {"b": {"c": 1}}, "a.b": {"z": 9}}
+    assert select(obj, "a.b.c") == {"a.b.c": 1}
+    assert select(obj, "a.b.z") == {"a.b.z": 9}
+
+
+def test_select_rejects_a_bogus_list_index_without_crashing():
+    """`--1` passed an isdigit() check and reached int(), which raised a bare ValueError."""
+    with pytest.raises(GpuOpsError) as e:
+        select(RESULT, "instances.--1.id")
+    assert e.value.code == ExitCode.SPEC_INVALID
 
 
 def test_select_indexes_lists_and_whole_keys_with_dots():
@@ -123,6 +160,14 @@ def test_read_log_by_phase(tmp_path: Path):
     assert read_log(p, phase="setup")[0] == ["Collecting torch", "ERROR: pip is confused"]
     assert read_log(p, phase="command")[0] == ["epoch 1", "ERROR: cuda oom", "epoch 2"]
     assert read_log(p, phase="command", grep="^epoch")[0] == ["epoch 1", "epoch 2"]
+
+
+def test_read_log_rejects_a_negative_tail(tmp_path: Path):
+    p = tmp_path / "job.log"
+    p.write_text(LOG)
+    with pytest.raises(GpuOpsError) as e:
+        read_log(p, tail=-5)  # an easy slip for --tail 5; it used to return the whole file
+    assert e.value.code == ExitCode.SPEC_INVALID
 
 
 def test_read_log_rejects_a_bad_regex(tmp_path: Path):

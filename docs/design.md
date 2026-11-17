@@ -277,6 +277,19 @@ Each layer covers the failure of the one before it.
     extra tool calls. It is read only from outputs whose checksums matched.
   - `--get PATH[,PATH]` returns just the named fields, so an agent never writes a one-off JSON parser.
   - `gpu-ops logs RUN_ID [--tail N] [--grep REGEX] [--phase setup|command]` pulls only the log lines wanted.
+- **Four rules each live in exactly one place,** because every site that re-derived one of them got it wrong:
+  - **Nothing persisted or printed holds a secret.** `Redactor.scrub` runs over *parsed values* at the two
+    boundaries — `Ledger._write` for the record on disk, `cmd_run` for the result on stdout. Redacting
+    serialized text cannot work: a secret containing a quote reaches a JSON file escaped, so the literal
+    value never matches. `job.log` keeps its per-line redaction, because it is written as it streams.
+  - **The result is bounded.** `result.compact` sizes *declared* outputs, collapsing a directory to its total
+    bytes and file count; otherwise a sharded adapter would put thousands of entries in a "compact" result.
+  - **Read only what you need.** `result.tail_lines` streams a bounded buffer and `read_head_bytes` reads to
+    a cap, so neither a huge `job.log` nor an oversized report file is ever materialized.
+  - **Printing never decides an exit code.** Every command returns through `cli._finish`, so a bad `--get`
+    path cannot replace the exit 10 a caller must act on with the exit 2 of a usage error.
+- **A record on disk outlives the dataclass that wrote it.** `Ledger.patch_record` updates named fields in
+  the raw JSON, so `spend --reconcile` cannot drop a key this version does not define.
 - **No interactive prompts anywhere.**
 - **Ask-rule snippet** (`docs/claude-settings-snippet.json`) for a calling project's `.claude/settings.json`:
   - Allowed without asking: `schema`, `validate`, `plan`, `pin-image`, `logs`, `ps`, `spend`, `kill`, `reap`.

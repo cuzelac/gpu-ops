@@ -304,12 +304,20 @@ def test_report_is_omitted_when_outputs_are_not_verified(env: Path):
 
 
 def test_report_never_carries_a_secret(env: Path):
-    secret = "s3cr3t-value-123"
-    code, rec, prov, _ = run_job(
+    """The secret holds a quote and a backslash, so it reaches the file JSON-escaped.
+
+    Redacting the raw text would miss it: the file holds `pa\\"ss`, never the literal value.
+    Redaction therefore runs over the parsed structure at the boundary.
+    """
+    secret = 'pa"ss\\word-123'
+    code, rec, prov, runner = run_job(
         env, secrets={"TOKEN": secret}, outputs=TWO_OUTPUTS, extra='[report]\nfiles = ["metrics.json"]\n',
-        command=f'{HELLO}; printf \'{{"tok": "\'"$TOKEN"\'"}}\' > $GPUOPS_OUT/metrics.json')
+        command=f'{HELLO}; python3 -c \'import json,os; print(json.dumps({{"tok": os.environ["TOKEN"]}}))\''
+                ' > $GPUOPS_OUT/metrics.json')
     assert code == ExitCode.OK, rec.error
-    assert secret not in json.dumps(rec.report) and rec.report["metrics.json"]["tok"] == "***"
+    assert rec.report["metrics.json"]["tok"] == "***", rec.report
+    assert secret not in json.dumps(rec.report)
+    assert secret not in (runner.run_dir / "record.json").read_text()
 
 
 def test_phase_markers_are_written_to_the_job_log(env: Path):
@@ -318,3 +326,22 @@ def test_phase_markers_are_written_to_the_job_log(env: Path):
     log = (runner.run_dir / "job.log").read_text()
     assert "[gpu-ops] phase: setup" in log and "[gpu-ops] phase: command" in log
     assert log.index("setting-up") < log.index("[gpu-ops] phase: command")
+
+
+def test_a_note_from_a_provider_error_is_redacted(env: Path):
+    """notes reach both record.json and the result, so they go through the same scrub."""
+    secret = "s3cr3t-value-123"
+    code, rec, prov, runner = run_job(env, secrets={"TOKEN": secret}, deadman=True,
+                                      provider_kw={"terminate_failures": 10_000},
+                                      command="echo hi > $GPUOPS_OUT/result.txt")
+    assert code == ExitCode.TEARDOWN_FAILED
+    assert secret not in json.dumps(rec.notes)
+    assert secret not in (runner.run_dir / "record.json").read_text()
+
+
+def test_report_read_when_a_spec_declares_no_outputs(env: Path):
+    """The no-outputs path used to skip the report and then claim it was omitted."""
+    code, rec, prov, _ = run_job(env, command="true", outputs="", extra='[report]\nfiles = []\n')
+    assert code == ExitCode.OK, rec.error
+    assert rec.report == {}
+    assert not any("report omitted" in n for n in rec.notes)

@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field, fields as _fields
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .errors import ExitCode, GpuOpsError
+from .names import is_run_id
 from .paths import state_dir
 
 
@@ -30,7 +32,10 @@ def utcnow() -> datetime:
 
 
 class Ledger:
-    def __init__(self, root: Path | None = None):
+    def __init__(self, root: Path | None = None, redactor: "Any | None" = None):
+        # every record written goes through this redactor, so no caller has to remember to
+        # redact its own field; the Runner wires its own in (it is the only writer with secrets)
+        self.redactor = redactor
         self.root = Path(root) if root else state_dir()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "runs").mkdir(exist_ok=True)
@@ -58,6 +63,8 @@ class Ledger:
         return state
 
     def run_dir(self, run_id: str) -> Path:
+        if not is_run_id(run_id):
+            raise GpuOpsError(ExitCode.SPEC_INVALID, f"{run_id!r} is not a run id")
         d = self.root / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
         return d
@@ -72,9 +79,28 @@ class Ledger:
         return out
 
     def write_record(self, record: "RunRecord") -> Path:
-        p = self.run_dir(record.run_id) / "record.json"
+        return self._write(record.run_id, record.to_dict())
+
+    def patch_record(self, run_id: str, **fields: Any) -> Path:
+        """Update these fields of a record on disk, leaving every other key untouched.
+
+        Reads and writes the raw JSON rather than rebuilding a RunRecord: a key this
+        version does not know — one a newer gpu-ops wrote, or one since removed from the
+        dataclass — must survive a rewrite instead of being silently dropped.
+        """
+        p = self.run_dir(run_id) / "record.json"
+        raw = {}
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        raw.update(fields)
+        return self._write(run_id, raw)
+
+    def _write(self, run_id: str, data: dict) -> Path:
+        if self.redactor is not None:
+            data = self.redactor.scrub(data)
+        p = self.run_dir(run_id) / "record.json"
         tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(p)
         return p
 
@@ -119,9 +145,3 @@ class RunRecord:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "RunRecord":
-        """Read a record written by any version: fields this one does not know are dropped."""
-        known = {f.name for f in _fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})

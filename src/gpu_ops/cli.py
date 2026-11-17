@@ -11,7 +11,6 @@ Exit codes: see errors.ExitCode and AGENTS.md.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import signal
 import sys
@@ -21,6 +20,7 @@ from typing import Any, Callable
 from . import __version__
 from .errors import ExitCode, GpuOpsError
 from .ledger import Ledger
+from .names import is_run_id
 from .policy import Policy, init_config, load_policy, policy_path, providers_path
 from .providers import load_providers
 from .result import DEFAULT_LOG_TAIL, compact, dumps, read_log, select
@@ -32,9 +32,29 @@ def _emit(args: argparse.Namespace, result: dict, human: Callable[[dict], str]) 
     if paths:  # --get prints JSON whether or not --json was given
         print(dumps(select(result, paths)))
     elif args.json:
-        print(json.dumps(result, indent=2, default=str))
+        print(dumps(result))
     else:
         print(human(result))
+
+
+def _finish(args: argparse.Namespace, code: int, result: dict, human: Callable[[dict], str]) -> int:
+    """Print the result, then return `code` unchanged.
+
+    Printing must never decide the exit code. A bad `--get` path would otherwise raise
+    exit 2 over the top of an outcome the caller has to act on — turning the exit 10 that
+    AGENTS.md rule 4 exists for ("a machine may still be billing") into a complaint about a
+    field name. A failed selection on an already-failed command prints the whole result
+    instead and keeps the command's own code.
+    """
+    try:
+        _emit(args, result, human)
+    except GpuOpsError as e:
+        if code == int(ExitCode.OK):
+            raise  # nothing happened that outranks a usage error
+        _err(f"error: {e.message}")
+        _err(f"printing the whole result instead; exit code {code} stands")
+        print(dumps(result))
+    return code
 
 
 def _noop(_line: str) -> None:
@@ -79,15 +99,13 @@ def cmd_init(args) -> int:
     written = init_config(force=args.force)
     res = {"ok": True, "exit_code": 0, "written": [str(p) for p in written],
            "policy": str(policy_path()), "providers": str(providers_path())}
-    _emit(args, res, lambda r: ("wrote " + ", ".join(r["written"])) if r["written"]
-          else f"already present: {r['policy']}, {r['providers']} (use --force to overwrite)")
-    return 0
+    return _finish(args, 0, res, lambda r: ("wrote " + ", ".join(r["written"])) if r["written"]
+                   else f"already present: {r['policy']}, {r['providers']} (use --force to overwrite)")
 
 
 def cmd_schema(args) -> int:
     from .spec import json_schema
-    print(json.dumps(json_schema(), indent=2))
-    return 0
+    return _finish(args, 0, json_schema(), dumps)  # the schema *is* the result; --get works on it
 
 
 def _spec_path(raw: str):
@@ -102,15 +120,14 @@ def cmd_validate(args) -> int:
     loaded = load_spec(_spec_path(args.spec))
     res = {"ok": True, "exit_code": 0, "spec": str(loaded.path), "name": loaded.spec.name,
            "inputs": {k: str(v) for k, v in loaded.input_paths.items()}}
-    _emit(args, res, lambda r: f"OK: {r['spec']} ({r['name']})")
-    return 0
+    return _finish(args, 0, res, lambda r: f"OK: {r['spec']} ({r['name']})")
 
 
 def cmd_pin_image(args) -> int:
     from .pin_image import pin
     pinned = pin(args.ref)
-    _emit(args, {"ok": True, "exit_code": 0, "ref": args.ref, "pinned": pinned}, lambda r: r["pinned"])
-    return 0
+    return _finish(args, 0, {"ok": True, "exit_code": 0, "ref": args.ref, "pinned": pinned},
+                   lambda r: r["pinned"])
 
 
 def cmd_run(args) -> int:
@@ -129,13 +146,12 @@ def cmd_run(args) -> int:
     if args.dry_run:
         res = {"ok": True, "exit_code": 0, "dry_run": True, "job": loaded.spec.name, "plan": plan.to_dict(),
                "would_create": "nothing (dry run)"}
-        _emit(args, res, lambda r: (
+        return _finish(args, 0, res, lambda r: (
             f"DRY RUN — nothing created.\n"
             f"  offer: {plan.offer.gpu_name} ×{plan.offer.count} ({plan.offer.tier}) on {plan.offer.provider} "
             f"at ${plan.offer.price_per_hr}/hr\n"
             f"  deadline: {plan.run_minutes:.1f} min   worst case: ${plan.worst_case_usd:.2f}   "
             f"spent this month: ${plan.month_spent_usd:.2f}\n" + "".join(f"  note: {n}\n" for n in plan.notes)))
-        return 0
 
     secrets = {k: read_op(ref, redactor) for k, ref in loaded.spec.secrets.items()}
     provider = providers[plan.offer.provider]
@@ -148,11 +164,11 @@ def cmd_run(args) -> int:
                     log=log, job_log=job_log)
     code, rec = runner.run()
     run_dir = ledger.run_dir(rec.run_id)
-    brief = compact(rec.to_dict(), run_dir)
+    record = redactor.scrub(rec.to_dict())  # the print boundary; the ledger scrubs the disk copy
+    brief = compact(record, run_dir, [o.path for o in loaded.spec.outputs])
     res = {"ok": brief["ok"], "exit_code": brief["exit_code"], "run_id": rec.run_id,
-           "run_dir": str(run_dir), "record": rec.to_dict()} if getattr(args, "full", False) else brief
-    _emit(args, res, lambda _r: _human_run(brief, run_dir))
-    return int(code)
+           "run_dir": str(run_dir), "record": record} if getattr(args, "full", False) else brief
+    return _finish(args, int(code), res, lambda _r: _human_run(brief, run_dir))
 
 
 def _human_run(b: dict, run_dir) -> str:
@@ -162,38 +178,39 @@ def _human_run(b: dict, run_dir) -> str:
              f"  teardown confirmed: {b['teardown_confirmed']}   outputs verified: {b['outputs_verified']}"
              f"   dead-man: {b['deadman']}"]
     if b["outputs"]:
-        lines.append(f"  outputs in {b['outputs_dir']}: "
-                     + ", ".join(f"{k} ({v} B)" for k, v in b["outputs"].items()))
+        lines.append(f"  outputs in {b['outputs_dir']}: " + ", ".join(
+            f"{k} ({v['files']} files, {v['bytes']} B)" if isinstance(v, dict) else f"{k} ({v} B)"
+            for k, v in b["outputs"].items()))
     if b.get("report"):
         lines.append("  report: " + ", ".join(b["report"]))
     lines += [f"  note: {n}" for n in b["notes"]]
     if b["error"]:
         lines.append(f"  error: {b['error']}")
-    lines += [f"  | {x}" for x in b.get("log_tail", [])]
+    lines += [f"  | {x}" for x in (b.get("log_tail") or [])]
     lines.append(f"  record: {run_dir}/record.json")
     return "\n".join(lines)
 
 
 def cmd_logs(args) -> int:
-    ledger = Ledger()
-    path = ledger.root / "runs" / args.run_id / "job.log"
+    if not is_run_id(args.run_id):  # never let a caller-supplied id become a path
+        raise GpuOpsError(ExitCode.SPEC_INVALID,
+                          f"{args.run_id!r} is not a run id (expected e.g. 20261112T140915-7a06)")
+    path = Ledger().run_dir(args.run_id) / "job.log"
     if not path.is_file():
         raise GpuOpsError(ExitCode.SPEC_INVALID, f"no job log for run {args.run_id!r} ({path} does not exist)")
     lines, in_file, matched = read_log(path, tail=args.tail, grep=args.grep, phase=args.phase)
     res = {"ok": True, "exit_code": 0, "run_id": args.run_id, "path": str(path),
            "lines_in_file": in_file, "lines_matched": matched, "lines": lines}
-    _emit(args, res, lambda r: "\n".join(r["lines"]))
-    return 0
+    return _finish(args, 0, res, lambda r: "\n".join(r["lines"]))
 
 
 def cmd_ps(args) -> int:
     from .ops import ps
     rows = ps(_all_providers(Redactor()), Ledger().current())
-    _emit(args, {"ok": True, "exit_code": 0, "instances": rows}, lambda r: "\n".join(
+    return _finish(args, 0, {"ok": True, "exit_code": 0, "instances": rows}, lambda r: "\n".join(
         [f"{len(rows)} gpu-ops instance(s) running"] +
         [f"  {x['provider']} {x['id']} {x['status']} {x['name']}  age {x['age_minutes']} min, "
          f"deadline in {x['minutes_to_deadline']} min, ~${x['cost_so_far_usd']}" for x in rows]))
-    return 0
 
 
 def cmd_kill(args) -> int:
@@ -203,10 +220,10 @@ def cmd_kill(args) -> int:
     res = kill(_all_providers(Redactor()), args.ids, all_=args.all)
     failed = [r for r in res if r.get("terminated") is False]
     code = ExitCode.TEARDOWN_FAILED if failed else ExitCode.OK
-    _emit(args, {"ok": not failed, "exit_code": int(code), "results": res}, lambda r: "\n".join(
+    return _finish(args, int(code), {"ok": not failed, "exit_code": int(code), "results": res},
+                   lambda r: "\n".join(
         [f"{len(res)} instance(s) processed"] + [f"  {x.get('id')}: terminated={x.get('terminated')}"
                                                   f"{'  ' + x['note'] if x.get('note') else ''}" for x in res]))
-    return int(code)
 
 
 def cmd_reap(args) -> int:
@@ -216,10 +233,10 @@ def cmd_reap(args) -> int:
     res = reap(_all_providers(Redactor()), grace_min=args.grace_min, max_age_min=max_age, dry_run=args.dry_run)
     failed = [r for r in res if r.get("terminated") is False]
     code = ExitCode.TEARDOWN_FAILED if failed else ExitCode.OK
-    _emit(args, {"ok": not failed, "exit_code": int(code), "reaped": res}, lambda r: "\n".join(
+    return _finish(args, int(code), {"ok": not failed, "exit_code": int(code), "reaped": res},
+                   lambda r: "\n".join(
         [f"{len(res)} instance(s) {'would be ' if args.dry_run else ''}reaped"] +
         [f"  {x['id']} {x['name']}: {x['reason']} -> terminated={x['terminated']}" for x in res]))
-    return int(code)
 
 
 def cmd_spend(args) -> int:
@@ -228,15 +245,13 @@ def cmd_spend(args) -> int:
     reconciled = 0
     if args.reconcile:
         providers = _all_providers(Redactor())
-        from .ledger import RunRecord
         for r in ledger.records():
             p = providers.get(r.get("provider") or "")
             if p is None or not r.get("instance_id") or r.get("cost_billed_usd") is not None:
                 continue
             billed = p.billed_cost(r["instance_id"], datetime.fromisoformat(r["started_at"]))
             if billed is not None:
-                r["cost_billed_usd"] = round(billed, 4)
-                ledger.write_record(RunRecord.from_dict(r))
+                ledger.patch_record(r["run_id"], cost_billed_usd=round(billed, 4))
                 reconciled += 1
     summary = summarize(ledger.records(), _maybe_policy())
     summary["reconciled_now"] = reconciled
@@ -259,8 +274,7 @@ def cmd_spend(args) -> int:
         for k in ("month", "project", "gpu"):
             lines.append(f"by {k}: " + ", ".join(f"{kk} ${vv['usd']:.2f}" for kk, vv in s["by"][k].items()))
         return "\n".join(lines)
-    _emit(args, res, human)
-    return 0
+    return _finish(args, 0, res, human)
 
 
 # ---------------- entry ----------------
@@ -289,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("plan", parents=[common], help="choose an offer and price the run; creates nothing (free). "
                                                        "Same as `run --dry-run`.")
     s.add_argument("spec")
-    s.set_defaults(fn=cmd_run, dry_run=True, quiet=True, progress=False, full=False)
+    s.set_defaults(fn=cmd_run, dry_run=True, progress=False, full=False)
     s = sub.add_parser("run", parents=[common], help="run a job (COSTS MONEY unless --dry-run)")
     s.add_argument("spec")
     s.add_argument("--dry-run", action="store_true", help="plan and price only; create nothing")
@@ -328,13 +342,13 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except GpuOpsError as e:
         if getattr(args, "json", False) or getattr(args, "get", None):
-            print(json.dumps({"ok": False, "exit_code": int(e.code), "error": e.message}, indent=2))
+            print(dumps({"ok": False, "exit_code": int(e.code), "error": e.message}))
         _err(f"error: {e.message}")
         return int(e.code)
     except Exception as e:  # a gpu-ops bug: still answer in the documented shape
         msg = f"internal error: {type(e).__name__}: {e}"
         if getattr(args, "json", False) or getattr(args, "get", None):
-            print(json.dumps({"ok": False, "exit_code": int(ExitCode.INTERNAL), "error": msg}, indent=2))
+            print(dumps({"ok": False, "exit_code": int(ExitCode.INTERNAL), "error": msg}))
         _err(msg)
         return int(ExitCode.INTERNAL)
 

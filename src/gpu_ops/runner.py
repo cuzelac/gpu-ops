@@ -29,7 +29,7 @@ from .planner import Plan
 from .policy import Policy
 from .providers.base import CreateRequest, Instance, Provider
 from .remote import TIMEOUT_EXIT, Remote, TransferError
-from .result import PHASE_MARKER
+from .result import PHASE_MARKER, read_head_bytes
 from .secrets import Redactor
 from .spec import LoadedSpec
 
@@ -83,6 +83,8 @@ class Runner:
         self.log = log or (lambda s: None)  # phase lines
         self.job_log = job_log or (lambda s: None)  # echo of the job's output; job.log is written either way
         self.inputs_manifest: dict[str, str] = {}  # kept off the record: see ledger's module docstring
+        if ledger.redactor is None:  # the runner is the only writer holding secrets
+            ledger.redactor = redactor
 
         self.run_id = new_run_id()
         self.started = _utc()
@@ -179,8 +181,9 @@ class Runner:
         self.record.status = "ok" if code == ExitCode.OK else "failed"
         if self.spec.report is not None and self.record.report is None:
             self.record.notes.append("report omitted: the outputs were not downloaded and verified")
-        if self.record.error:
-            self.record.error = self.redact(self.record.error)
+        # one scrub of the whole record, before anything persists, prints or returns it:
+        # notes and report carry provider and job text, and no field should need its own call
+        self.record = RunRecord(**self.redact.scrub(self.record.to_dict()))
         self.ledger.write_record(self.record)
         return code, self.record
 
@@ -344,6 +347,7 @@ class Runner:
         rels = [o.path for o in self.spec.outputs]
         if not rels:
             self.record.outputs_verified = True
+            self._read_report(self.run_dir / "out")
             return
         out_lines: list[str] = []
         rc = self.remote.run(remote_manifest_script(self.remote.root + "/out", rels), timeout_s=900,
@@ -382,8 +386,10 @@ class Runner:
                 report[rel] = None
                 self.record.notes.append(f"report file missing from the outputs: {rel}")
                 continue
-            size = path.stat().st_size
-            text = self.redact(path.read_bytes()[:rs.max_bytes].decode("utf-8", "replace"))
+            # read the cap, never the whole file: a report file is an output, and outputs
+            # can be checkpoints. Secrets are redacted once, at the boundaries in run().
+            raw, size = read_head_bytes(path, rs.max_bytes)
+            text = raw.decode("utf-8", "replace")
             if size > rs.max_bytes:
                 report[rel] = {"truncated": True, "bytes": size, "text": text}
                 continue

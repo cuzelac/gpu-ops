@@ -15,12 +15,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 PREFIX = "gpuops-"
-_NAME = re.compile(r"^gpuops-(?P<run>\d{8}T\d{6}-[0-9a-f]{4})-d(?P<deadline>\d{9,11})(?:-(?P<job>[a-z0-9-]*))?$")
+RUN_ID = r"\d{8}T\d{6}-[0-9a-f]{4}"  # the one definition of a run id's shape; see is_run_id()
+_NAME = re.compile(rf"^gpuops-(?P<run>{RUN_ID})-d(?P<deadline>\d{{9,11}})(?:-(?P<job>[a-z0-9-]*))?$")
+_RUN_ID = re.compile(RUN_ID)
 
 
 def new_run_id(now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
     return f"{now.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(2)}"
+
+
+def is_run_id(value: str) -> bool:
+    """Whether this is a run id gpu-ops could have made.
+
+    Anything that becomes a path under the state directory is checked with this, so a
+    caller-supplied id can never walk out of `runs/` (e.g. `gpu-ops logs ../../secrets`).
+    """
+    return bool(_RUN_ID.fullmatch(value or ""))
 
 
 def instance_name(run_id: str, deadline_epoch: int, job_name: str) -> str:

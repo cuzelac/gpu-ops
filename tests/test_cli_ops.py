@@ -19,6 +19,7 @@ from gpu_ops.ops import reap_decisions
 from gpu_ops.policy import Policy
 from gpu_ops.providers.base import CreateRequest, Instance
 from gpu_ops.providers.fake import DEFAULT_OFFERS, FakeProvider
+from gpu_ops.result import compact
 from gpu_ops.spend import summarize
 
 from .conftest import write_spec
@@ -67,9 +68,8 @@ def test_full_run_via_cli(env: Path):
     assert FakeProvider(env / "fake").list_instances(PREFIX) == []
 
 
-COMPACT_FIELDS = {"ok", "exit_code", "run_id", "status", "error", "gpu", "tier", "price_per_hr", "minutes",
-                  "cost_estimate_usd", "teardown_confirmed", "outputs_verified", "outputs_dir", "outputs",
-                  "deadman", "notes"}
+# derived, not hand-copied: the shape is compact()'s to define, and it must not vary per run
+COMPACT_FIELDS = set(compact({}, Path(".")))
 
 
 def test_run_json_is_compact_by_default(env: Path):
@@ -78,6 +78,7 @@ def test_run_json_is_compact_by_default(env: Path):
     out = json.loads(r.stdout)
     assert set(out) == COMPACT_FIELDS  # no record, no manifests, no phase timings
     assert out["outputs"] == {"result.txt": 3} and out["minutes"] is not None
+    assert out["report"] is None and out["log_tail"] is None  # present, not absent
     assert len(r.stdout.splitlines()) <= 25  # an agent pays for every line of this
     assert "sha256" not in r.stdout and len(json.dumps(out)) < 1200
 
@@ -173,9 +174,64 @@ def test_logs_tail_grep_and_phase(env: Path):
 
 
 def test_logs_for_an_unknown_run_is_exit_2(env: Path):
-    r = cli("logs", "nope-not-a-run", "--json")
+    r = cli("logs", "20261112T140915-dead", "--json")  # well-formed, but no such run
     assert r.returncode == ExitCode.SPEC_INVALID
     assert "no job log" in json.loads(r.stdout)["error"]
+
+
+@pytest.mark.parametrize("bad", ["nope-not-a-run", "../../../../etc", "..", "a/b"])
+def test_logs_rejects_anything_that_is_not_a_run_id(env: Path, bad: str):
+    """The run id becomes a path, so it is validated before it is one."""
+    r = cli("logs", bad, "--json")
+    assert r.returncode == ExitCode.SPEC_INVALID
+    assert "is not a run id" in json.loads(r.stdout)["error"]
+
+
+def test_a_bad_get_path_never_overwrites_a_failed_run_exit_code(env: Path):
+    """Printing must not decide the exit code: exit 6 here, not the usage error's exit 2."""
+    spec = write_spec(env, command="echo nope; exit 3")
+    r = cli("run", str(spec), "--get", "no_such_field")
+    assert r.returncode == ExitCode.JOB_FAILED, r.stdout + r.stderr
+    assert "no such field" in r.stderr  # the usage error is still reported
+    assert json.loads(r.stdout)["exit_code"] == 6  # and the whole result is printed instead
+
+
+def test_a_bad_get_path_on_a_clean_run_is_still_exit_2(env: Path):
+    r = cli("run", str(write_spec(env)), "--get", "no_such_field")
+    assert r.returncode == ExitCode.SPEC_INVALID
+
+
+def test_get_works_on_schema(env: Path):
+    r = cli("schema", "--get", "$defs.LimitsSpec.properties")  # it used to accept --get and ignore it
+    assert r.returncode == 0, r.stderr
+    assert "max_cost_usd" in r.stdout
+    assert "min_vram_gb" not in r.stdout  # only the selected subtree
+
+
+def test_reconcile_keeps_fields_this_version_does_not_know(env: Path):
+    """A record written by another version must survive a rewrite, not be silently trimmed."""
+    prov = FakeProvider(env / "fake")
+    inst = prov.create(CreateRequest(name=instance_name(new_run_id(), 1, "old"), offer=DEFAULT_OFFERS[0],
+                                     image="x", bootstrap="", public_key=""))
+    run_id = new_run_id()
+    d = env / "state" / "runs" / run_id
+    d.mkdir(parents=True)
+    (d / "record.json").write_text(json.dumps({
+        "run_id": run_id, "job": "old", "project": "tests", "kind": "other", "spec_path": "x",
+        "provider": "fake", "instance_id": inst.id, "started_at": "2026-11-01T10:00:00+00:00",
+        "price_per_hr": 0.2, "gpu_count": 1,
+        "inputs_manifest": {"data/a.txt": "f" * 64},  # a field this version no longer defines
+        "a_field_from_the_future": 42,
+    }))
+
+    r = cli("spend", "--reconcile", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(r.stdout)["reconciled_now"] == 1
+
+    saved = json.loads((d / "record.json").read_text())
+    assert saved["cost_billed_usd"] == 0.0  # the field reconcile came to write
+    assert saved["inputs_manifest"] == {"data/a.txt": "f" * 64}  # and nothing else was dropped
+    assert saved["a_field_from_the_future"] == 42
 
 
 

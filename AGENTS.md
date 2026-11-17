@@ -34,6 +34,7 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 | `gpu-ops plan SPEC` | free | Picks an offer and prices the worst case against policy. Creates nothing. Same as `run --dry-run`. |
 | `gpu-ops run SPEC` | **money** | The full run: create, upload, setup, command, download and verify, then delete the machine. Blocks until done. Prints a compact result; `--full` prints the whole record, `--progress` streams the job's output to stderr. |
 | `gpu-ops logs RUN_ID` | free | Lines from a finished run's `job.log`. `--tail N` (default 200, `0` = all), `--grep REGEX`, `--phase setup\|command`. |
+| `gpu-ops schema --get PATH` | free | `--get` drills into the schema itself, e.g. `--get '$defs.LimitsSpec.properties'`. |
 | `gpu-ops ps` | free | Live gpu-ops machines, as the provider reports them. |
 | `gpu-ops kill ID… \| --all` | stops spend | Deletes gpu-ops machines. Never touches machines without the `gpuops-` prefix. |
 | `gpu-ops reap [--dry-run]` | stops spend | Deletes gpu-ops machines more than 10 minutes past their deadline. |
@@ -70,8 +71,10 @@ gpu-ops run job.toml --get exit_code,cost_estimate_usd,report.lora/train-record.
 ```
 
 A path is dotted; list items are indexed (`instances.0.id`); a key that itself contains dots (an output or
-report file name) matches as a whole. **A path that does not exist is exit 2**, and the error says which
-fields were available.
+report file name) matches as a whole, and you can keep drilling past it. **A path that does not exist is
+exit 2**, and the error says which fields were available — *except* when the command itself already failed:
+then its own exit code stands, the whole result is printed, and the `--get` complaint goes to stderr. A
+mistyped field name can never hide an exit 10.
 
 **stderr is quiet.** Phase lines go to stderr only when it is a terminal, or with `run --progress`; the job's
 own output only with `--progress`. `runs/<id>/job.log` is always written either way — read it with `gpu-ops logs`.
@@ -91,8 +94,11 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
    "cost_estimate_usd": 0.0103, "teardown_confirmed": true, "outputs_verified": true,
    "outputs_dir": "/home/you/.local/state/gpu-ops/runs/20261112T140915-7a06/out",
    "outputs": {"nvidia-smi.txt": 1673, "hello.json": 88}, "deadman": "armed", "notes": [],
-   "report": {"lora/train-record.json": {"eval_loss": 0.42, "best_epoch": 2}}}
+   "report": {"lora/train-record.json": {"eval_loss": 0.42, "best_epoch": 2}}, "log_tail": null}
   ```
+
+  **Every key is always there.** `report` is `null` when the spec has no `[report]` table and `log_tail` is
+  `null` when the run succeeded, so you can read any field without guarding for its absence.
 
   | Field | Meaning |
   |---|---|
@@ -101,11 +107,11 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
   | `cost_estimate_usd` | Estimated cost of the run |
   | `teardown_confirmed` | **Must be true.** The provider confirmed the machine is gone |
   | `outputs_verified` | Outputs match their checksums |
-  | `outputs` | Each verified output and its size in bytes; the files are in `outputs_dir` |
+  | `outputs` | Each **declared** output and its size in bytes; a directory is `{"bytes": n, "files": n}` so the result cannot grow with the job's output. The files are in `outputs_dir` |
   | `deadman` | `armed` or `unarmed` |
   | `notes` | Anything gpu-ops wants you to know (capacity fallback, a missing report file, …) |
-  | `report` | **Look here first for the job's own results.** Only present when the spec has a `[report]` table |
-  | `log_tail` | The last 20 lines of `job.log`. **On failure only** |
+  | `report` | **Look here first for the job's own results.** `null` when the spec has no `[report]` table |
+  | `log_tail` | The last 20 lines of `job.log` when the run failed; `null` when it succeeded |
 
   - **`report`** holds one entry per `[report]` file: a `.json` file as the parsed object, anything else as
     `{"text": "…"}`. A file over `max_bytes` is `{"truncated": true, "bytes": N, "text": "…"}`, one that is
