@@ -181,17 +181,9 @@ class Runner:
         self.record.status = "ok" if code == ExitCode.OK else "failed"
         if self.spec.report is not None and self.record.report is None:
             self.record.notes.append("report omitted: the outputs were not downloaded and verified")
-        # Redaction is per field (see RunRecord's metadata) and sets only named fields, so it
-        # cannot invent or drop one. Guarded anyway: this runs after teardown, and a run that
-        # spent money must leave a record even if redacting it somehow fails.
-        try:
-            self.record = self.redact.scrub_record(self.record)
-        except Exception as e:  # pragma: no cover - defence for a path that should not exist
-            self.record.error = self.record.error and "[redaction failed]"
-            self.record.notes = ["[redaction failed, notes withheld]"]
-            self.record.report = None
-            self.record.notes.append(f"could not redact the record: {type(e).__name__}")
-        self.ledger.write_record(self.record)
+        # the ledger is the single applier of the field policy; take back what it wrote so
+        # the record this returns is the redacted one, without a second scrub here
+        self.record = self.ledger.write_record(self.record)
         return code, self.record
 
     def _hash_inputs(self) -> None:
@@ -206,8 +198,10 @@ class Runner:
         self.inputs_manifest = full
         self.record.inputs_hash = manifest_digest(full)
         self.record.inputs_file_count = len(full)
+        # scrub_tree, not scrub: here the *keys* are the file paths, and the values are
+        # sha256 hashes that can never be a secret
         (self.run_dir / "inputs-manifest.json").write_text(
-            json.dumps(self.redact.scrub(full), indent=2, sort_keys=True), encoding="utf-8")
+            json.dumps(self.redact.scrub_tree(full), indent=2, sort_keys=True), encoding="utf-8")
 
     def _acquire(self) -> None:
         with self._phase("provision"):

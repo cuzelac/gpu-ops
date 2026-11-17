@@ -73,9 +73,12 @@ gpu-ops run job.toml --get exit_code,cost_estimate_usd,report.lora/train-record.
 
 A path is dotted; list items are indexed (`instances.0.id`); a key that itself contains dots (an output or
 report file name) matches as a whole, and you can keep drilling past it. **A path that does not exist is
-exit 2**, and the error says which fields were available — *except* when the command itself already failed:
-then its own exit code stands, the whole result is printed, and the `--get` complaint goes to stderr. A
-mistyped field name can never hide an exit 10.
+exit 2**, and the error names the deepest field set it reached.
+
+**A mistyped field name can never hide an outcome.** If the command itself failed, its exit code stands, the
+**whole result** is printed anyway (on exit 10 that is what tells you which machines are alive), and the
+`--get` complaint goes to stderr. The same holds if gpu-ops cannot render a result at all: a clean `run`
+still reports 0, and `kill`/`reap` report 10 rather than claiming success they could not confirm.
 
 **stderr is quiet.** Phase lines go to stderr only when it is a terminal, or with `run --progress`; the job's
 own output only with `--progress`. `runs/<id>/job.log` is always written either way — read it with `gpu-ops logs`.
@@ -124,6 +127,8 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
   - Outputs land in `<run_dir>/out/<output path>`.
 - **`logs`:** `{"ok", "exit_code", "run_id", "path", "lines_in_file", "lines_matched", "lines": [...]}`.
   Without `--json` it prints just the lines. A `RUN_ID` that is not a run id is exit 2, and nothing is created.
+- **`spend`:** also has `unreadable_records` (int) — records whose fields are not the shapes this version
+  expects. They are left out of the totals and counted here rather than failing the command.
 - **`spend --reconcile`:** adds `reconciled_now` (int) and `reconcile_skipped` (list of strings). A record it
   cannot read is skipped and listed there; the report is still produced.
 - **`ps`:** `{"instances": [{"provider", "id", "name", "status", "deadline", "minutes_to_deadline", "age_minutes", "cost_so_far_usd", ...}]}`

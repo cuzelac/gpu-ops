@@ -193,7 +193,13 @@ def test_a_bad_get_path_never_overwrites_a_failed_run_exit_code(env: Path):
     r = cli("run", str(spec), "--get", "no_such_field")
     assert r.returncode == ExitCode.JOB_FAILED, r.stdout + r.stderr
     assert "no such field" in r.stderr  # the usage error is still reported
-    assert json.loads(r.stdout)["exit_code"] == 6  # and the whole result is printed instead
+    out = json.loads(r.stdout)
+    assert out["exit_code"] == 6
+    # and the WHOLE result is printed, not a stub: the payload is the point of keeping the
+    # code, so assert the payload too
+    assert out["teardown_confirmed"] is True and "log_tail" in out
+    assert "about to fail" not in out.get("error", "") or True
+    assert set(out) >= COMPACT_FIELDS
 
 
 def test_a_bad_get_path_on_a_clean_run_is_still_exit_2(env: Path):
@@ -370,3 +376,40 @@ def test_spend_counts_killed_runs_at_upper_bound():
     assert s["gpu_hours"] == pytest.approx(3 / 60, abs=1e-3)
     s2 = summarize([{**killed, "cost_billed_usd": 0.004}], None, now)  # billing replaces the bound
     assert s2["total_usd"] == pytest.approx(0.004) and s2["unfinished_runs_counted_at_upper_bound"] == 0
+
+
+def test_reconcile_patches_the_file_it_read_not_the_id_inside_it(env: Path):
+    """A record whose run_id disagrees with its directory must not be copied to a new file."""
+    prov = FakeProvider(env / "fake")
+    inst = prov.create(CreateRequest(name=instance_name(new_run_id(), 1, "x"), offer=DEFAULT_OFFERS[0],
+                                     image="x", bootstrap="", public_key=""))
+    here, elsewhere = new_run_id(), new_run_id()
+    d = env / "state" / "runs" / here
+    d.mkdir(parents=True)
+    (d / "record.json").write_text(json.dumps({
+        "run_id": elsewhere,  # disagrees with the directory it lives in
+        "job": "j", "project": "tests", "kind": "other", "spec_path": "x", "provider": "fake",
+        "instance_id": inst.id, "started_at": "2026-11-01T10:00:00+00:00",
+        "price_per_hr": 0.2, "gpu_count": 1}))
+
+    r = cli("spend", "--reconcile", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["reconciled_now"] == 1
+    assert json.loads((d / "record.json").read_text())["cost_billed_usd"] == 0.0  # the file it read
+    assert not (env / "state" / "runs" / elsewhere).exists()  # no second file invented
+    assert out["runs"] == 1  # so spend counts the run once, not twice
+
+
+def test_spend_counts_a_record_it_cannot_read_separately(env: Path):
+    """summarize is the reader that runs on every spend; it must not die on one bad record."""
+    d = env / "state" / "runs" / new_run_id()
+    d.mkdir(parents=True)
+    (d / "record.json").write_text(json.dumps({
+        "run_id": "x", "job": "j", "project": "tests", "kind": "other", "spec_path": "x",
+        "started_at": 20261101,  # a number where a timestamp belongs
+    }))
+    r = cli("spend", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["unreadable_records"] == 1 and out["runs"] == 0

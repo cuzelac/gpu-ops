@@ -79,41 +79,59 @@ class Ledger:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def records(self) -> list[dict]:
+    def records_with_paths(self) -> list[tuple[Path, dict]]:
+        """Every readable record, with the file it came from.
+
+        A writer needs the path, not the record's `run_id` field: the two can disagree, and
+        resolving the path from the field would write a second file and leave the first one
+        unpatched forever.
+        """
         out = []
         for p in sorted((self.root / "runs").glob("*/record.json")):
             try:
-                out.append(json.loads(p.read_text(encoding="utf-8")))
+                out.append((p, json.loads(p.read_text(encoding="utf-8"))))
             except (OSError, json.JSONDecodeError):
                 continue
         return out
 
-    def write_record(self, record: "RunRecord") -> Path:
-        """Persist a record, redacted per field. Field names are never rewritten."""
+    def records(self) -> list[dict]:
+        return [rec for _, rec in self.records_with_paths()]
+
+    def write_record(self, record: "RunRecord") -> "RunRecord":
+        """Persist a record, redacted per field, and return exactly what was written.
+
+        The one place `scrub_record` is applied. Callers use the returned record rather than
+        redacting their own copy, so there is a single applier as well as a single policy.
+        """
         if self.redactor is not None:
             record = self.redactor.scrub_record(record)
-        return self._write(record.run_id, record.to_dict())
+        self._write(record.run_id, record.to_dict())
+        return record
 
-    def patch_record(self, run_id: str, **fields: Any) -> Path:
-        """Update these fields of a record on disk, leaving every other key untouched.
+    def patch_record(self, path: Path, **fields: Any) -> Path:
+        """Update these fields of the record at `path`, leaving every other key untouched.
+
+        Takes the file, not a run id: `records_with_paths` found it by globbing, and a
+        record whose `run_id` field disagrees with its directory would otherwise be copied
+        to a second file and never patched.
 
         Reads and writes the raw JSON rather than rebuilding a RunRecord: a key this
         version does not know — one a newer gpu-ops wrote, or one since removed from the
         dataclass — must survive a rewrite instead of being silently dropped.
         """
-        p = self.run_dir(run_id) / "record.json"
-        raw = {}
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         raw.update(fields if self.redactor is None else self.redactor.scrub(fields))
-        return self._write(run_id, raw)
+        return self._write_json(path, raw)
 
     def _write(self, run_id: str, data: dict) -> Path:
-        p = self.ensure_run_dir(run_id) / "record.json"
-        tmp = p.with_suffix(".json.tmp")
+        return self._write_json(self.ensure_run_dir(run_id) / "record.json", data)
+
+    @staticmethod
+    def _write_json(path: Path, data: dict) -> Path:
+        tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(p)
-        return p
+        tmp.replace(path)
+        return path
 
 
 @dataclass
@@ -148,7 +166,9 @@ class RunRecord:
     phases: dict[str, float] = field(default_factory=dict)  # seconds per phase
     inputs_hash: str | None = None  # one digest over the whole inputs manifest
     inputs_file_count: int | None = None
-    outputs_manifest: dict[str, str] = field(default_factory=dict)
+    # keys are paths the job chose when it wrote the files, so they are data, like report's
+    outputs_manifest: dict[str, str] = field(default_factory=dict,
+                                             metadata={"redact": "keys+values"})
     outputs_verified: bool | None = None
     teardown_confirmed: bool | None = None
     notes: list[str] = field(default_factory=list, metadata={"redact": "value"})

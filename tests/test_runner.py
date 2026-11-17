@@ -363,3 +363,23 @@ def test_report_read_when_a_spec_declares_no_outputs(env: Path):
     assert code == ExitCode.OK, rec.error
     assert rec.report == {}
     assert not any("report omitted" in n for n in rec.notes)
+
+
+def test_a_secret_in_a_file_name_is_redacted_too(env: Path):
+    """The existing secret tests put secrets in file *contents*; paths are keys, and keys leak.
+
+    inputs-manifest.json is keyed by input path, and outputs_manifest by the paths the job
+    chose under $GPUOPS_OUT. Both reach disk, and outputs_manifest reaches `--full`.
+    """
+    secret = "s3cr3tname"
+    (env / "data").mkdir(exist_ok=True)  # write_spec also creates it, but we get there first
+    (env / "data" / f"{secret}.csv").write_text("rows\n")
+    code, rec, prov, runner = run_job(
+        env, secrets={"TOKEN": secret}, outputs='[[outputs]]\npath = "d"\n',
+        command=f"mkdir -p $GPUOPS_OUT/d; echo hi > $GPUOPS_OUT/d/{secret}.txt")
+    assert code == ExitCode.OK, rec.error
+
+    manifest = (runner.run_dir / "inputs-manifest.json").read_text()
+    assert secret not in manifest and "***" in manifest
+    assert secret not in (runner.run_dir / "record.json").read_text()
+    assert any("***" in k for k in rec.outputs_manifest), rec.outputs_manifest

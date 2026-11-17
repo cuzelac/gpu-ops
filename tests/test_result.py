@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -199,3 +200,54 @@ def test_read_log_rejects_a_bad_regex(tmp_path: Path):
     with pytest.raises(GpuOpsError) as e:
         read_log(p, grep="(unclosed")
     assert e.value.code == ExitCode.SPEC_INVALID
+
+
+# ---------------- the _finish seam ----------------
+
+class _Args:
+    """The two attributes _finish and _emit read."""
+    json = True
+    get = None
+
+
+def test_finish_returns_the_code_its_result_carries(capsys):
+    from gpu_ops.cli import _finish
+    assert _finish(_Args(), lambda: result(ExitCode.TEARDOWN_FAILED, results=[]), lambda r: "") == 10
+    assert _finish(_Args(), lambda: result(0, a=1), lambda r: "") == 0
+
+
+def test_finish_reports_the_fallback_when_the_work_itself_fails(capsys):
+    """kill and reap have already terminated instances, so the conservative code is 10."""
+    from gpu_ops.cli import _finish
+
+    def work() -> dict:
+        raise RuntimeError("provider returned nonsense")
+
+    assert _finish(_Args(), work, lambda r: "", fallback=int(ExitCode.TEARDOWN_FAILED)) == 10
+    out = json.loads(capsys.readouterr().out)
+    assert out["exit_code"] == 10 and "provider returned nonsense" in out["error"]
+
+
+def test_finish_lets_a_deliberate_error_keep_its_own_code():
+    """A GpuOpsError is an outcome with an exit code; the fallback must not swallow it."""
+    from gpu_ops.cli import _finish
+
+    def work() -> dict:
+        raise GpuOpsError(ExitCode.SPEC_INVALID, "bad spec")
+
+    with pytest.raises(GpuOpsError) as e:
+        _finish(_Args(), work, lambda r: "", fallback=int(ExitCode.TEARDOWN_FAILED))
+    assert e.value.code == ExitCode.SPEC_INVALID
+
+
+def test_finish_keeps_a_clean_code_when_printing_breaks(capsys):
+    """A formatting bug of ours must not turn a successful run into a failure."""
+    from gpu_ops.cli import _finish
+
+    def human(_r: dict) -> str:
+        raise KeyError("a field the formatter assumed")
+
+    args = _Args()
+    args.json = False
+    assert _finish(args, lambda: result(0, a=1), human) == 0
+    assert json.loads(capsys.readouterr().out)["a"] == 1  # the result is still printed

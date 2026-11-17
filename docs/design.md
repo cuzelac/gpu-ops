@@ -277,34 +277,40 @@ Each layer covers the failure of the one before it.
     extra tool calls. It is read only from outputs whose checksums matched.
   - `--get PATH[,PATH]` returns just the named fields, so an agent never writes a one-off JSON parser.
   - `gpu-ops logs RUN_ID [--tail N] [--grep REGEX] [--phase setup|command]` pulls only the log lines wanted.
-- **Two types carry the rules, because one function per rule was not enough.** A first attempt gave each
-  rule a single implementation and still produced defects at new sites: a scrubber called in three places,
-  a bound that was conditional on an argument, a guard around one statement of five. The rules now live on
-  the data they govern:
-  - **`RunRecord` declares its own redaction policy** per field (`metadata={"redact": "value" |
-    "keys+values" | "none"}`), and `Redactor.scrub_record` applies it with `dataclasses.replace`. Field
-    *names* are never rewritten — scrubbing keys renamed `cost_estimate_usd` for a secret `cost` and lost
-    the record of a paid-for run for a secret `tier`. Where keys really are the job's data (a `[report]`
-    map) the field says so.
-  - **`result.result(code, **fields)` supplies `ok` and `exit_code`** for every command, so the contract in
-    AGENTS.md holds by construction instead of by ten correct copies.
-  - **`cli._finish` owns everything after a command's real work** — building the result as well as printing
-    it — so no formatting, selection or file read can decide the exit code.
-  - **The spec makes the bad states unrepresentable:** `[[outputs]]` paths must be unique and
-    non-overlapping (so no file is counted twice), and `[report]`'s `files × max_bytes` is capped in total.
-- **Four rules each live in exactly one place,** because every site that re-derived one of them got it wrong:
-  - **Nothing persisted or printed holds a secret.** `Redactor.scrub` runs over *parsed values* at the two
-    boundaries — `Ledger._write` for the record on disk, `cmd_run` for the result on stdout. Redacting
-    serialized text cannot work: a secret containing a quote reaches a JSON file escaped, so the literal
-    value never matches. `job.log` keeps its per-line redaction, because it is written as it streams.
-  - **The result is bounded.** `result.compact` sizes *declared* outputs, collapsing a directory to its total
-    bytes and file count; otherwise a sharded adapter would put thousands of entries in a "compact" result.
-  - **Read only what you need.** `result.tail_lines` streams a bounded buffer and `read_head_bytes` reads to
-    a cap, so neither a huge `job.log` nor an oversized report file is ever materialized.
-  - **Printing never decides an exit code.** Every command returns through `cli._finish`, so a bad `--get`
-    path cannot replace the exit 10 a caller must act on with the exit 2 of a usage error.
-- **A record on disk outlives the dataclass that wrote it.** `Ledger.patch_record` updates named fields in
-  the raw JSON, so `spend --reconcile` cannot drop a key this version does not define.
+- **Each rule lives on the data or the signature that owns it.** Three review rounds taught this the
+  expensive way: every rule given a *type or a validator* stayed fixed, and every rule given a *convention* —
+  a helper to opt into, a scrubber to choose, a tolerance to remember — came back at a new site in the next
+  round. So:
+  - **Nothing persisted or printed holds a secret.** `RunRecord` declares the policy per field
+    (`metadata={"redact": "value" | "keys+values" | "none"}`); `Redactor.scrub_record` applies it with
+    `dataclasses.replace`, and `Ledger.write_record` is the only applier — it returns the record it wrote, so
+    a caller uses that instead of redacting its own copy. Field *names* are never rewritten: scrubbing keys
+    renamed `cost_estimate_usd` for a secret `cost`, and for a secret `tier` raised after teardown and before
+    the write, losing the record of a run that had already spent money. Where the keys really are the job's
+    (`report`, `outputs_manifest`) the field says `keys+values`. `job.log` keeps per-line redaction because it
+    is written as it streams, and `inputs-manifest.json` uses `scrub_tree` because there the keys are the paths
+    and the values are only hashes.
+  - **The result decides the exit code; printing cannot.** `cli._finish` takes a callback that returns the
+    result, and reads the code back out of it, so the two cannot disagree and a command cannot leave the
+    statement that computes its own code outside the guard — which `kill`, `reap` and `spend` all used to do
+    *after* terminating instances or writing to disk. A deliberate `GpuOpsError` keeps its own code; an
+    unexpected failure in the work reports a conservative fallback (exit 10 for `kill`/`reap`: gpu-ops cannot
+    claim the machines are gone); a failure in *printing* keeps the command's code and prints the whole result,
+    because on exit 10 that payload says which machines are alive. A caller's own bad `--get` path on a clean
+    command is still exit 2, as AGENTS.md documents.
+  - **Every result carries `ok` and `exit_code`,** because `result.result()` supplies them rather than ten
+    commands copying them correctly.
+  - **The result is bounded.** `result.compact` sizes *declared* outputs and collapses a directory to its
+    bytes and file count; the spec refuses overlapping or duplicate outputs (which would double-count) and
+    caps `[report]`'s `files × max_bytes` in total. The bad states are unrepresentable rather than handled.
+  - **Read only what you need.** `result.tail_lines` streams a bounded buffer, `read_head_bytes` reads to a
+    cap, and `Ledger.current` streams an append-only file, so nothing materializes a whole file to return a
+    slice of it. Those readers raise `GpuOpsError`, never a bare `OSError`, so a missing file never surfaces
+    as "internal error".
+  - **A reader tolerates what it did not write.** `Ledger.records`, `Ledger.current`, the reconcile loop and
+    `spend.summarize` all skip what they cannot parse and *report the count* rather than failing a free
+    command. `Ledger.patch_record` takes the file it read, not the `run_id` inside it — those can disagree,
+    and resolving the path from the field wrote a second record and left the first unpatched forever.
 - **No interactive prompts anywhere.**
 - **Spend gate** (`docs/claude-settings-snippet.json`), merged into the user-level `~/.claude/settings.json` so one copy covers every project. Verified 2026-11-17:
   - Allow every `gpu-ops` command, by bare name and through the `bin/` wrappers.

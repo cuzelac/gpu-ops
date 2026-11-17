@@ -36,8 +36,17 @@ def _cost(r: dict) -> float:
 
 
 def summarize(records: list[dict], policy: Policy | None, now: datetime | None = None) -> dict:
+    """Totals over the run records. Tolerates a record it did not write.
+
+    Every other reader of persisted state skips what it cannot parse rather than failing the
+    command (`Ledger.current`, `Ledger.records`, the reconcile loop). This one is the reader
+    that runs on *every* `gpu-ops spend`, so it does the same: a record whose fields are not
+    the types this version expects is counted in `unreadable_records` and left out. A total
+    that silently omits a run would be worse, so the count is reported, not swallowed.
+    """
     now = now or datetime.now(timezone.utc)
     recs = [r for r in records if r.get("started_at")]
+    unreadable = 0
     by = {k: defaultdict(lambda: {"usd": 0.0, "gpu_hours": 0.0, "runs": 0})
           for k in ("month", "provider", "project", "kind", "gpu")}
     overhead_s = command_s = 0.0
@@ -46,6 +55,7 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
     unreconciled = 0
     unfinished = 0
     for r in recs:
+      try:
         cost = _cost(r)
         secs = _upper_bound(r)[1] if _unfinished(r) else (r.get("billed_seconds") or 0)
         unfinished += _unfinished(r)
@@ -66,6 +76,8 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
             not_replaceable += 1
         if r.get("cost_billed_usd") is None and r.get("instance_id"):
             unreconciled += 1
+      except (TypeError, ValueError, AttributeError, KeyError):
+        unreadable += 1  # a field that is not the type this version expects
 
     # trailing 3 calendar months including this one
     months = []
@@ -80,7 +92,8 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
     out = {
         "total_usd": round(total, 4),
         "gpu_hours": round(gpu_hours_total, 3),
-        "runs": len(recs),
+        "runs": len(recs) - unreadable,
+        "unreadable_records": unreadable,
         "unreconciled_runs": unreconciled,
         "unfinished_runs_counted_at_upper_bound": unfinished,
         "trailing_3mo_monthly_usd": round(trailing, 4),

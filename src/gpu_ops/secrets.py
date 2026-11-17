@@ -18,14 +18,18 @@ If the service account read fails, gpu-ops says so on stderr and falls back to t
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .errors import ExitCode, GpuOpsError
+
+if TYPE_CHECKING:  # a type-only import: ledger imports this module at run time
+    from .ledger import RunRecord
 
 SA_TARGET_DEFAULT = "gpu-ops/op-service-account"
 _UNSET = object()
@@ -89,7 +93,7 @@ class Redactor:
             return [self.scrub_tree(v) for v in obj]
         return self(obj) if isinstance(obj, str) else obj
 
-    def scrub_record(self, record: Any) -> Any:
+    def scrub_record(self, record: "RunRecord") -> "RunRecord":
         """Redact a run record field by field, according to each field's own policy.
 
         The policy lives on the dataclass field (`metadata={"redact": …}`), so the question
@@ -98,8 +102,6 @@ class Redactor:
         Field *names* are never rewritten, and only named fields are set, so this cannot
         invent a key or drop one.
         """
-        import dataclasses
-
         changes: dict[str, Any] = {}
         for f in dataclasses.fields(record):
             policy = f.metadata.get("redact", "none")
