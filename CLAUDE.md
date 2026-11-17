@@ -4,7 +4,7 @@ Users of the CLI (including agents running GPU jobs) read AGENTS.md; this file i
 
 ## Where to work
 - `C:\Users\cuzel\src\gpu-ops` is the **live install**: the WSL `gpu-ops` command (editable `uv tool` install) and the scheduled reaper run its files directly. Keep it on a clean, pushed `main`; never edit or switch branches there.
-- Do all changes in a git worktree, one per branch: `git worktree add ../gpu-ops-wt/<branch> -b <branch> origin/main`; remove it after the PR merges (`git worktree remove`).
+- Do all changes in a git worktree, one per branch: `git worktree add ../gpu-ops-wt/<branch> -b <branch> origin/main`; remove it after the PR merges (`git worktree remove`). Add and remove them with **Windows** git: worktrees are registered by absolute path, so one created as `C:/…` is invisible to WSL git ("not a working tree").
 
 ## Build & test
 - Code lives on the Windows side; run Python/tests inside WSL from your worktree, with a per-branch venv off /mnt/c:
