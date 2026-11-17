@@ -306,7 +306,7 @@ class Runner:
                 rels = sorted({k.split("/", 1)[0] for k in self.record.inputs_manifest})
                 remote.run(remote_manifest_script(remote.root + "/in", rels), timeout_s=600, on_line=out.append)
                 got, _ = parse_sha256sum("\n".join(out))
-                problems = compare(self.record.inputs_manifest, got)
+                problems = compare(self.record.inputs_manifest, got, missing="did not arrive on the machine")
                 if problems:
                     raise GpuOpsError(ExitCode.TRANSFER_FAILED, "upload verification failed: " + "; ".join(problems[:5]))
 

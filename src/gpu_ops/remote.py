@@ -73,6 +73,20 @@ def _with_remote_timeout(timeout_s: float | None) -> str:
     return f"timeout -k 30 {int(max(1, timeout_s))} bash -s" if timeout_s else "bash -s"
 
 
+def rsync_put_args(local: Path, dest_spec: str, include: list[str] | None) -> tuple[list[str], str | None]:
+    """rsync arguments (after `rsync -a ...`) and stdin for uploading `local` to `dest_spec` (ending in /).
+
+    With `include`, only the listed paths are sent. `-r` is required: with --files-from, rsync does
+    not recurse into a listed directory even under -a, so a directory entry would arrive empty while
+    upload verification expects every file beneath it (bug reported 2026-11-17, exit 7).
+    """
+    if local.is_dir() and include:
+        return ["-r", "--files-from=-", f"{local}/", dest_spec], "\n".join(include) + "\n"
+    if local.is_dir():
+        return [f"{local}/", dest_spec], None
+    return [str(local), dest_spec], None
+
+
 class SshRemote:
     def __init__(self, host: str, port: int, key_path: Path, user: str = "root", root: str = "/gpuops"):
         self.host, self.port, self.key_path, self.user, self.root = host, port, Path(key_path), user, root
@@ -108,14 +122,8 @@ class SshRemote:
         mk = subprocess.run(self._ssh(f"mkdir -p {shlex.quote(dest)}"), capture_output=True, text=True, timeout=60)
         if mk.returncode != 0:
             raise TransferError(f"mkdir {dest} failed: {mk.stderr.strip()}")
-        base = ["rsync", "-a", "--protect-args", "-e", self._rsync_e()]
-        if local.is_dir() and include:
-            cmd = base + ["--files-from=-", f"{local}/", f"{self.user}@{self.host}:{dest}/"]
-            stdin = "\n".join(include) + "\n"
-        elif local.is_dir():
-            cmd, stdin = base + [f"{local}/", f"{self.user}@{self.host}:{dest}/"], None
-        else:
-            cmd, stdin = base + [str(local), f"{self.user}@{self.host}:{dest}/"], None
+        args, stdin = rsync_put_args(local, f"{self.user}@{self.host}:{dest}/", include)
+        cmd = ["rsync", "-a", "--protect-args", "-e", self._rsync_e(), *args]
         r = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
         if r.returncode != 0:
             raise TransferError(f"upload {local} failed (rsync exit {r.returncode}): {r.stderr.strip()[-500:]}")
@@ -151,7 +159,10 @@ class LocalRemote:
         if local.is_dir() and include:
             for rel in include:
                 (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(local / rel, dest / rel)
+                if (local / rel).is_dir():
+                    shutil.copytree(local / rel, dest / rel, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(local / rel, dest / rel)
         elif local.is_dir():
             shutil.copytree(local, dest, dirs_exist_ok=True)
         else:
