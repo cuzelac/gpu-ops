@@ -146,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File $t install     # (re)install
 | [docs/unattended.md](docs/unattended.md) | No 1Password prompts: service account + Windows Credential Manager |
 | [docs/glossary.md](docs/glossary.md) | One-line definitions |
 | [docs/research/2026-11-provider-comparison.md](docs/research/2026-11-provider-comparison.md) | Provider research and prices |
-| [docs/claude-settings-snippet.json](docs/claude-settings-snippet.json) | Permission rules for a calling project: free commands allowed, `run` asks you |
+| [docs/claude-settings-snippet.json](docs/claude-settings-snippet.json) | Permission rules to merge into `~/.claude/settings.json` (user-level, covers every project): all gpu-ops commands allowed, `run` asks you, `init` denied. Verified 2026-11-17 |
 
 ## Development
 

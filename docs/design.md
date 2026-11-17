@@ -257,11 +257,12 @@ Each layer covers the failure of the one before it.
 
 - **Machine-readable output:** every command accepts `--json` and returns one documented shape, `{ok, exit_code, run_id, ...}`.
 - **No interactive prompts anywhere.**
-- **Ask-rule snippet** (`docs/claude-settings-snippet.json`) for a calling project's `.claude/settings.json`:
-  - Allowed without asking: `schema`, `validate`, `plan`, `pin-image`, `ps`, `spend`, `kill`, `reap`.
-  - Ask first: `run`.
-  - Free planning is its own command, `gpu-ops plan` (same as `run --dry-run`), because an ask rule for `gpu-ops run` would also catch `run --dry-run`.
-  - I show you the exact snippet before adding it to HS-AI-Coach.
+- **Spend gate** (`docs/claude-settings-snippet.json`), merged into the user-level `~/.claude/settings.json` so one copy covers every project. Verified 2026-11-17:
+  - Allow every `gpu-ops` command, by bare name and through the `bin/` wrappers.
+  - Ask for anything containing `gpu-ops run`. Ask rules take precedence over allow rules.
+  - Deny anything containing `gpu-ops init` (`init --force` would reset the policy).
+  - Free planning is its own command, `gpu-ops plan` (same as `run --dry-run`), because the ask rule also catches `run --dry-run`.
+  - Limits: ask rules don't apply in permission-bypass mode, and a command that reaches gpu-ops indirectly (via a script) isn't matched. The policy caps and prepaid balance still bound spend.
 - **MCP:** not in v1. The core is a library, so an MCP server would be a thin wrapper added later.
 - **Docs:**
   - `README.md`: what gpu-ops is, install, a 5-minute walkthrough.
