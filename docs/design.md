@@ -74,6 +74,10 @@ required = true
 path = "lora/train-record.json"
 required = true                   # success = required outputs exist and checksums match, not exit code alone
 
+[report]                          # optional: small output files whose contents come back in the result
+files = ["lora/train-record.json"]
+max_bytes = 16384                 # per file; default 16 KiB, hard max 64 KiB
+
 [gpu]
 min_vram_gb = 24
 count = 1
@@ -158,12 +162,17 @@ src/gpu_ops/
 11. **Execute:**
     - Run `setup`, then `command`, over SSH.
     - Secrets go into that process's environment only.
-    - Output streams to `runs/<id>/job.log`, which is redacted.
+    - Output streams to `runs/<id>/job.log`, which is redacted and carries a `[gpu-ops] phase: …` marker
+      per phase, so `gpu-ops logs --phase` can split it.
+    - It does **not** stream to stderr unless stderr is a terminal (phase lines) or `--progress` is given
+      (phase lines and the job's output). An agent pays for every byte it reads.
     - The local timer enforces the deadline and kills the command at it.
 12. **Collect:**
     - Build a manifest of `/gpuops/out` on the instance, then rsync it down.
     - Verify every hash locally.
     - A missing required output, or any mismatch, is a failure. Downloaded files are kept and marked unverified.
+    - Only then: read the `[report]` files from the verified local copies into the record. Unverified data
+      never reaches the result.
 13. **Teardown** (in `finally`, and on SIGINT and SIGTERM):
     - Call `terminate`, then confirm with `get` that the instance is gone. Retry with backoff for up to 5 minutes.
     - If that still fails: exit 10, print `TEARDOWN FAILED — INSTANCE MAY STILL BE BILLING: <id>`, and leave the ledger entry `live`.
@@ -171,7 +180,10 @@ src/gpu_ops/
     - provider, GPU, tier, data centre, image digest
     - start, end and billed seconds
     - estimated cost; the provider-reported cost is filled in later by `spend --reconcile`
-    - inputs hash, output manifest, exit code
+    - inputs hash and input file count, output manifest, exit code
+      (the per-file input hashes go to `inputs-manifest.json`, not the record: one entry per file would
+      swamp a record for a dataset of thousands of files, and nothing reads them after upload)
+    - the `[report]` file contents, if the spec asked for any
     - whether the dead-man timer was armed
     - the job kind and project
 
@@ -256,9 +268,18 @@ Each layer covers the failure of the one before it.
 ## 5. Agent interface and docs
 
 - **Machine-readable output:** every command accepts `--json` and returns one documented shape, `{ok, exit_code, run_id, ...}`.
+- **Short by default, because tokens are the agent's cost:**
+  - `run` prints a compact result (~20 lines): status, GPU, cost, teardown, outputs with their sizes, notes,
+    and `report`. On failure it adds `log_tail`, the last 20 lines of `job.log`. `--full` returns the whole record.
+  - Hashes are the clearest example of the problem: a per-file manifest is proof gpu-ops needs and an agent
+    does not. Output hashes stay in the record (`--full`); input hashes moved to their own file.
+  - `[report]` carries the job's own numbers — eval loss, counts, peak memory — so reading results costs no
+    extra tool calls. It is read only from outputs whose checksums matched.
+  - `--get PATH[,PATH]` returns just the named fields, so an agent never writes a one-off JSON parser.
+  - `gpu-ops logs RUN_ID [--tail N] [--grep REGEX] [--phase setup|command]` pulls only the log lines wanted.
 - **No interactive prompts anywhere.**
 - **Ask-rule snippet** (`docs/claude-settings-snippet.json`) for a calling project's `.claude/settings.json`:
-  - Allowed without asking: `schema`, `validate`, `plan`, `pin-image`, `ps`, `spend`, `kill`, `reap`.
+  - Allowed without asking: `schema`, `validate`, `plan`, `pin-image`, `logs`, `ps`, `spend`, `kill`, `reap`.
   - Ask first: `run`.
   - Free planning is its own command, `gpu-ops plan` (same as `run --dry-run`), because an ask rule for `gpu-ops run` would also catch `run --dry-run`.
   - I show you the exact snippet before adding it to HS-AI-Coach.
@@ -268,6 +289,7 @@ Each layer covers the failure of the one before it.
   - `AGENTS.md`: commands, JSON shapes, exit codes, the policy, "always validate and dry-run first", "on exit 10 run `gpu-ops kill --all` and tell the human".
   - `docs/job-spec.md`: every field, with one example per job kind.
   - `docs/runbook.md`: how to find and kill anything billing, both with gpu-ops and in the RunPod console.
+  - `gpu-ops logs`: the job's own output after the fact, so the run itself does not have to print it.
   - `docs/glossary.md`: the terms above.
 
 ## 6. Spend tracking and rent vs buy

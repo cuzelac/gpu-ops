@@ -5,6 +5,7 @@
       "Bash(*gpu-ops validate *)",
       "Bash(*gpu-ops plan *)",
       "Bash(*gpu-ops pin-image *)",
+      "Bash(*gpu-ops logs *)",
       "Bash(*gpu-ops ps*)",
       "Bash(*gpu-ops spend*)",
       "Bash(*gpu-ops kill *)",
