@@ -71,6 +71,39 @@ Every input file is hashed. The hashes are checked again on the machine after up
 
 - Only listed outputs come back, so large checkpoints you don't list are not downloaded.
 - Each file is hashed on the machine and checked after download (exit 7 on a mismatch).
+- Paths must be unique, and one output may not sit inside another (`lora` and `lora/adapter` is an
+  error): the run result reports a size per declared output, and overlapping ones would double-count.
+- **Never put a secret in an output path.** It would be in this file in plain text anyway, and the run
+  result redacts the paths it reports, so the output would not be matched back to what you declared and
+  would be missing from `outputs`.
+
+### `[report]` (optional)
+
+Small output files whose **contents come back inside the run result**, so the caller sees the job's own
+numbers without opening any file.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `files` | yes | Paths under `$GPUOPS_OUT`, at most 16. Each must also be listed in `[[outputs]]`, directly or inside an output directory. |
+| `max_bytes` | no | Per file, default 16384, hard maximum 65536. A larger file is truncated. |
+
+`files × max_bytes` must not exceed **256 KiB** — the whole table is bounded, not just each file in
+it, because the result is read by an agent that pays per byte.
+
+```toml
+[report]
+files = ["lora/train-record.json"]
+max_bytes = 16384
+```
+
+- **In the result:** `report = {"lora/train-record.json": {...}}`. A `.json` file arrives as the parsed
+  object; anything else as `{"text": "…"}`.
+- **Read only after verification.** The contents come from the downloaded copy whose checksum matched, so
+  a run that failed verification (exit 7) has no `report` at all.
+- **Edge cases:** a file over `max_bytes` is `{"truncated": true, "bytes": N, "text": "…"}`; a missing file
+  is `null` with a note; a `.json` file that does not parse is `{"text": "…", "parse_error": "…"}`.
+- **Secrets are redacted** in report contents, as they are in `job.log`.
+- A `files` entry that is not an output is a spec error (exit 2).
 
 ### `[gpu]`
 
@@ -161,6 +194,9 @@ from = "C:/Users/cuzel/models/round-a/a2/data-v1b"
 path = "lora/adapter"
 [[outputs]]
 path = "lora/train-record.json"
+
+[report]
+files = ["lora/train-record.json"]     # eval loss, best epoch and peak memory come back in the result
 
 [gpu]
 min_vram_gb = 24

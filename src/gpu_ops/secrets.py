@@ -18,13 +18,18 @@ If the service account read fails, gpu-ops says so on stderr and falls back to t
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from .errors import ExitCode, GpuOpsError
+
+if TYPE_CHECKING:  # a type-only import: ledger imports this module at run time
+    from .ledger import RunRecord
 
 SA_TARGET_DEFAULT = "gpu-ops/op-service-account"
 _UNSET = object()
@@ -42,7 +47,15 @@ def op_binary() -> str:
 
 
 class Redactor:
-    """Replaces every known secret value with *** in any text it sees."""
+    """Replaces every known secret value with *** in any text or parsed value it sees.
+
+    Two limits, both deliberate and both the reason `scrub` exists:
+    - A value shorter than 4 characters is not registered; it would match everywhere.
+    - Matching is literal, so a secret only matches text that holds it verbatim. A secret
+      spanning two lines never matches a line-by-line log, and one containing a quote or
+      backslash does not match its own JSON-escaped form. So redact *parsed values* with
+      `scrub` wherever the data is structured, and keep `__call__` for raw log lines.
+    """
 
     def __init__(self) -> None:
         self._values: set[str] = set()
@@ -55,6 +68,50 @@ class Redactor:
         for v in sorted(self._values, key=len, reverse=True):
             text = text.replace(v, "***")
         return text
+
+    def scrub(self, obj: Any) -> Any:
+        """Redact every string *value* inside a parsed structure. Keys are left alone.
+
+        Keys are never touched here because in gpu-ops' own structures they are the schema,
+        not data: a secret that happened to be `tier` or `cost` would rename the field and
+        either break the record or silently corrupt what `spend` reads. Where the keys really
+        are the job's data — a `[report]` file map — use `scrub_tree`.
+        """
+        if isinstance(obj, str):
+            return self(obj)
+        if isinstance(obj, dict):
+            return {k: self.scrub(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self.scrub(v) for v in obj]
+        return obj
+
+    def scrub_tree(self, obj: Any) -> Any:
+        """Like `scrub`, but redacts keys too. For data whose keys the job chose."""
+        if isinstance(obj, dict):
+            return {(self(k) if isinstance(k, str) else k): self.scrub_tree(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self.scrub_tree(v) for v in obj]
+        return self(obj) if isinstance(obj, str) else obj
+
+    def scrub_record(self, record: "RunRecord") -> "RunRecord":
+        """Redact a run record field by field, according to each field's own policy.
+
+        The policy lives on the dataclass field (`metadata={"redact": …}`), so the question
+        "is this field redacted, and are its keys data or schema?" is answered once, where
+        the field is declared, instead of at each site that writes or prints a record.
+        Field *names* are never rewritten, and only named fields are set, so this cannot
+        invent a key or drop one.
+        """
+        changes: dict[str, Any] = {}
+        for f in dataclasses.fields(record):
+            policy = f.metadata.get("redact", "none")
+            if policy == "none":
+                continue
+            value = getattr(record, f.name)
+            if value is None:
+                continue
+            changes[f.name] = self.scrub_tree(value) if policy == "keys+values" else self.scrub(value)
+        return dataclasses.replace(record, **changes) if changes else record
 
 
 def credential_script() -> Path:
@@ -124,7 +181,7 @@ def read_op(ref: str, redactor: Redactor | None = None) -> str:
             why = ((r.stderr or "").strip().splitlines() or ["unknown error"])[-1]
         except subprocess.TimeoutExpired:
             why = "timed out after 60 s"
-        why = why.replace(token, "***")
+        why = redactor(why) if redactor is not None else why.replace(token, "***")
         print(f"gpu-ops: service account could not read {ref} ({why}); falling back to the 1Password app",
               file=sys.stderr)
 

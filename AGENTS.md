@@ -12,6 +12,9 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
    - Secrets are `op://…` references under `[secrets]`. A literal value is rejected.
 4. **On exit 10, act at once.** Run `gpu-ops kill --all --json`, then tell the human. A machine may still be billing.
 5. **Prefer `--json`** and branch on `exit_code`, never on message text.
+   - Output is short by default. Use `--get` to pull single fields, and `--full` only when you need the whole record.
+   - If the job writes its own metrics to a file, put that file in `[report]` and read `report` in the result,
+     instead of opening files under `runs/<id>/out`.
 6. **`gpu-ops run` (without `--dry-run`) is set to ask the human** in Claude Code projects that use gpu-ops.
    - That is expected. Don't try to get around it.
 
@@ -27,10 +30,12 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 
 | Command | Cost | What it does |
 |---|---|---|
-| `gpu-ops schema` | free | Prints the job spec's JSON Schema. Read it to write a spec. |
+| `gpu-ops schema` | free | The job spec's JSON Schema, under `schema`. Read it to write a spec. |
 | `gpu-ops validate SPEC` | free | Checks the spec and that its inputs exist. |
 | `gpu-ops plan SPEC` | free | Picks an offer and prices the worst case against policy. Creates nothing. Same as `run --dry-run`. |
-| `gpu-ops run SPEC` | **money** | The full run: create, upload, setup, command, download and verify, then delete the machine. Blocks until done. |
+| `gpu-ops run SPEC` | **money** | The full run: create, upload, setup, command, download and verify, then delete the machine. Blocks until done. Prints a compact result; `--full` prints the whole record, `--progress` streams the job's output to stderr. |
+| `gpu-ops logs RUN_ID` | free | Lines from a finished run's `job.log`. `--tail N` (default 200, `0` = all), `--grep REGEX`, `--phase setup\|command`. |
+| `gpu-ops schema --get PATH` | free | `--get` drills into the schema, e.g. `--get 'schema.$defs.LimitsSpec.properties'`. |
 | `gpu-ops ps` | free | Live gpu-ops machines, as the provider reports them. |
 | `gpu-ops kill ID… \| --all` | stops spend | Deletes gpu-ops machines. Never touches machines without the `gpuops-` prefix. |
 | `gpu-ops reap [--dry-run]` | stops spend | Deletes gpu-ops machines more than 10 minutes past their deadline. |
@@ -56,7 +61,27 @@ When several things fail, 10 always wins. Otherwise the first failure is reporte
 
 ## JSON shapes
 
-Every command prints one object, which always has `ok` (bool) and `exit_code` (int). On failure it also has `error` (str).
+Every command prints one object, which always has `ok` (bool) and `exit_code` (int) — `schema` included, with the schema itself under `schema`. On failure it also has `error` (str). One function supplies those two keys for every command, so they cannot go missing.
+
+**`--get PATH[,PATH]` works on every command** and prints only those fields, as JSON, with or without `--json`.
+Use it instead of parsing the result yourself:
+
+```bash
+gpu-ops plan job.toml --get plan.offer.price_per_hr,plan.worst_case_usd
+gpu-ops run job.toml --get exit_code,cost_estimate_usd,report.lora/train-record.json.eval_loss
+```
+
+A path is dotted; list items are indexed (`instances.0.id`); a key that itself contains dots (an output or
+report file name) matches as a whole, and you can keep drilling past it. **A path that does not exist is
+exit 2**, and the error names the deepest field set it reached.
+
+**A mistyped field name can never hide an outcome.** If the command itself failed, its exit code stands, the
+**whole result** is printed anyway (on exit 10 that is what tells you which machines are alive), and the
+`--get` complaint goes to stderr. The same holds if gpu-ops cannot render a result at all: a clean `run`
+still reports 0, and `kill`/`reap` report 10 rather than claiming success they could not confirm.
+
+**stderr is quiet.** Phase lines go to stderr only when it is a terminal, or with `run --progress`; the job's
+own output only with `--progress`. `runs/<id>/job.log` is always written either way — read it with `gpu-ops logs`.
 
 - **`plan`:**
   ```json
@@ -66,22 +91,46 @@ Every command prints one object, which always has `ok` (bool) and `exit_code` (i
             "run_minutes": 20.0, "worst_case_usd": 0.0533, "month_spent_usd": 0.0,
             "alternatives": [...], "notes": []}}
   ```
-- **`run`:**
-  - Fields: `{"ok", "exit_code", "run_id", "run_dir", "record": {...}}`.
-  - Useful record fields:
+- **`run`** prints this, and nothing more, unless you ask for more:
+  ```json
+  {"ok": true, "exit_code": 0, "run_id": "20261112T140915-7a06", "status": "ok", "error": null,
+   "gpu": "RTX A5000", "tier": "community", "price_per_hr": 0.16, "minutes": 0.9,
+   "cost_estimate_usd": 0.0103, "teardown_confirmed": true, "outputs_verified": true,
+   "outputs_dir": "/home/you/.local/state/gpu-ops/runs/20261112T140915-7a06/out",
+   "outputs": {"nvidia-smi.txt": 1673, "hello.json": 88}, "deadman": "armed", "notes": [],
+   "report": {"lora/train-record.json": {"eval_loss": 0.42, "best_epoch": 2}}, "log_tail": null}
+  ```
 
-    | Field | Meaning |
-    |---|---|
-    | `status` | Whether the run succeeded |
-    | `error` | What went wrong, if anything |
-    | `cost_estimate_usd` | Estimated cost of the run |
-    | `teardown_confirmed` | **Must be true.** The provider confirmed the machine is gone |
-    | `outputs_verified` | Outputs match their checksums |
-    | `outputs_manifest` | Each output file and its hash |
-    | `deadman` | `armed` or `unarmed` |
-    | `phases` | Seconds spent in each phase |
+  **Every key is always there.** `report` is `null` when the spec has no `[report]` table and `log_tail` is
+  `null` when the run succeeded, so you can read any field without guarding for its absence.
 
+  | Field | Meaning |
+  |---|---|
+  | `status` | Whether the run succeeded |
+  | `error` | What went wrong, if anything |
+  | `cost_estimate_usd` | Estimated cost of the run |
+  | `teardown_confirmed` | **Must be true.** The provider confirmed the machine is gone |
+  | `outputs_verified` | Outputs match their checksums |
+  | `outputs` | Each **declared** output: a file's size in bytes, a directory as `{"bytes": n, "files": m}`. The result never grows with the number of files the job wrote. `bytes` is `null` when something could not be read, so `0` always means empty. The files are in `outputs_dir` |
+  | `deadman` | `armed` or `unarmed` |
+  | `notes` | Anything gpu-ops wants you to know (capacity fallback, a missing report file, …) |
+  | `report` | **Look here first for the job's own results.** `null` when the spec has no `[report]` table |
+  | `log_tail` | The last 20 lines of `job.log` when the run failed; `null` when it succeeded |
+
+  - **`report`** holds one entry per `[report]` file: a `.json` file as the parsed object, anything else as
+    `{"text": "…"}`. A file over `max_bytes` is `{"truncated": true, "bytes": N, "text": "…"}`, one that is
+    missing is `null`, and a `.json` file that does not parse is `{"text": "…", "parse_error": "…"}`.
+    If the outputs failed verification (exit 7) there is no `report` at all — gpu-ops never reads unverified data.
+  - **`--full`** gives `{"ok", "exit_code", "run_id", "run_dir", "record": {...}}` instead: the whole record,
+    including `phases`, `outputs_manifest` (path → hash), `inputs_hash`, `inputs_file_count` and `worst_case_usd`.
+  - Per-file **input** hashes are not in the record at all; they are in `<run_dir>/inputs-manifest.json`.
   - Outputs land in `<run_dir>/out/<output path>`.
+- **`logs`:** `{"ok", "exit_code", "run_id", "path", "lines_in_file", "lines_matched", "lines": [...]}`.
+  Without `--json` it prints just the lines. A `RUN_ID` that is not a run id is exit 2, and nothing is created.
+- **`spend`:** also has `unreadable_records` (int) — records whose fields are not the shapes this version
+  expects. They are left out of the totals and counted here rather than failing the command.
+- **`spend --reconcile`:** adds `reconciled_now` (int) and `reconcile_skipped` (list of strings). A record it
+  cannot read is skipped and listed there; the report is still produced.
 - **`ps`:** `{"instances": [{"provider", "id", "name", "status", "deadline", "minutes_to_deadline", "age_minutes", "cost_so_far_usd", ...}]}`
 - **`spend`:** `total_usd`, `trailing_3mo_monthly_usd`, `overhead_share`, `rent_vs_buy{...}`, `by{month,provider,project,kind,gpu}`, `warning`.
 

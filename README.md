@@ -10,7 +10,8 @@ Rent a cloud GPU, run a job, bring the results home, and shut it down. Every tim
 
 | Piece | State |
 |---|---|
-| Core: spec, policy, planner, run lifecycle, teardown | Built. 61 tests pass against a fake provider |
+| Core: spec, policy, planner, run lifecycle, teardown | Built. 102 tests pass against a fake provider |
+| Agent-sized output: compact `run` result, `[report]` files, `gpu-ops logs`, `--get` | Built 2026-11-16. `run --json` is ~20 lines instead of ~60; per-file input hashes moved to `inputs-manifest.json` |
 | RunPod adapter | Built. Uses live stock, falls back past out-of-stock GPUs |
 | Smoke job | **Passed on RunPod 2026-11-12**: run `20261112T140915-7a06`, PRO 6000 MIG 24GB (secure), 54 s billed, est. $0.0103. Outputs verified, teardown confirmed, 0 pods left |
 | Kill test | **Passed 2026-11-12.** Two jobs; both gpu-ops processes killed with `kill -9` mid-command. Job A's dead-man timer deleted it on its own (gone 15 s after its deadline); `kill --all` deleted job B; 0 pods left |
@@ -125,8 +126,16 @@ powershell -ExecutionPolicy Bypass -File $t install     # (re)install
    - The inputs are uploaded and checked.
    - The command runs, and the outputs come back and are checked.
    - The machine is deleted and the deletion confirmed.
-   - The cost is printed, and the record is saved under `~/.local/state/gpu-ops/runs/<run-id>/`.
-4. **Check that nothing is left, and see the spend so far.**
+   - A short summary is printed, and the record is saved under `~/.local/state/gpu-ops/runs/<run-id>/`.
+
+   It is quiet while it works. **To watch it**, add `--progress`: phase lines and the job's own output go to
+   stderr (they are in `job.log` either way). The summary is deliberately short, because an agent pays to read
+   it; `--full` prints the whole record.
+4. **Read the job's output afterwards.** Free.
+   ```bash
+   gpu-ops logs <run-id> --tail 20          # or --grep ERROR, or --phase setup
+   ```
+5. **Check that nothing is left, and see the spend so far.**
    ```bash
    gpu-ops ps
    gpu-ops spend

@@ -51,11 +51,15 @@ def test_success_brings_back_verified_outputs(env: Path):
     assert rec.outputs_verified and rec.teardown_confirmed
     out = runner.run_dir / "out" / "result.txt"
     assert out.read_text() == "alpha\n"
-    assert set(rec.inputs_manifest) == {"data/a.txt", "data/sub/b.txt"}
+    assert set(runner.inputs_manifest) == {"data/a.txt", "data/sub/b.txt"}
+    manifest = json.loads((runner.run_dir / "inputs-manifest.json").read_text())
+    assert set(manifest) == {"data/a.txt", "data/sub/b.txt"}
+    assert rec.inputs_file_count == 2 and rec.inputs_hash
     assert {"provision", "upload", "command", "download", "teardown"} <= set(rec.phases)
     assert rec.cost_estimate_usd is not None and rec.deadman == "unarmed"
     saved = json.loads((runner.run_dir / "record.json").read_text())
     assert saved["exit_code"] == 0 and saved["status"] == "ok"
+    assert "inputs_manifest" not in saved  # per-file input hashes stay out of the record
     assert_nothing_alive(prov)
 
 
@@ -177,11 +181,11 @@ def test_secrets_reach_the_job_but_not_the_log(env: Path):
 
 def test_include_limits_upload(env: Path):
     spec_extra_inputs = '[[outputs]]\npath = "result.txt"\n'
-    code, rec, prov, _ = run_job(env, outputs=spec_extra_inputs, inputs=False,
-                                 extra='[[inputs]]\nname = "d"\nfrom = "data"\ninclude = ["sub/b.txt"]\n',
-                                 command="ls -R $GPUOPS_IN > $GPUOPS_OUT/result.txt")
+    code, rec, prov, runner = run_job(env, outputs=spec_extra_inputs, inputs=False,
+                                      extra='[[inputs]]\nname = "d"\nfrom = "data"\ninclude = ["sub/b.txt"]\n',
+                                      command="ls -R $GPUOPS_IN > $GPUOPS_OUT/result.txt")
     assert code == ExitCode.OK, rec.error
-    assert set(rec.inputs_manifest) == {"d/sub/b.txt"}
+    assert set(runner.inputs_manifest) == {"d/sub/b.txt"}
 
 
 def test_capacity_fallback_to_next_offer(env: Path):
@@ -225,3 +229,157 @@ class RecordCheckingRemote(LocalRemote):
 def test_record_written_before_job_runs(env: Path):
     code, rec, prov, _ = run_job(env, remote_cls=RecordCheckingRemote)
     assert code == ExitCode.OK, rec.error
+
+
+# ---------------- [report] files in the result (issue #5) ----------------
+
+TWO_OUTPUTS = '[[outputs]]\npath = "result.txt"\n[[outputs]]\npath = "metrics.json"\n'
+HELLO = "echo hi > $GPUOPS_OUT/result.txt"
+
+
+def test_report_json_file_comes_back_as_an_object(env: Path):
+    code, rec, prov, runner = run_job(
+        env, outputs=TWO_OUTPUTS, extra='[report]\nfiles = ["metrics.json"]\n',
+        command=f'{HELLO}; printf \'{{"eval_loss": 0.42, "best_epoch": 2}}\' > $GPUOPS_OUT/metrics.json')
+    assert code == ExitCode.OK, rec.error
+    assert rec.report == {"metrics.json": {"eval_loss": 0.42, "best_epoch": 2}}
+    saved = json.loads((runner.run_dir / "record.json").read_text())
+    assert saved["report"]["metrics.json"]["best_epoch"] == 2  # and it is in record.json too
+    assert_nothing_alive(prov)
+
+
+def test_report_text_file_comes_back_as_text(env: Path):
+    code, rec, prov, _ = run_job(
+        env, outputs='[[outputs]]\npath = "result.txt"\n[[outputs]]\npath = "notes.txt"\n',
+        extra='[report]\nfiles = ["notes.txt"]\n',
+        command=f"{HELLO}; echo loss=0.4 > $GPUOPS_OUT/notes.txt")
+    assert code == ExitCode.OK, rec.error
+    assert rec.report["notes.txt"]["text"].strip() == "loss=0.4"
+
+
+def test_report_file_inside_an_output_directory(env: Path):
+    code, rec, prov, _ = run_job(
+        env, outputs='[[outputs]]\npath = "lora"\n',
+        extra='[report]\nfiles = ["lora/train-record.json"]\n',
+        command='mkdir -p $GPUOPS_OUT/lora; printf \'{"best_epoch": 1}\' > $GPUOPS_OUT/lora/train-record.json')
+    assert code == ExitCode.OK, rec.error
+    assert rec.report == {"lora/train-record.json": {"best_epoch": 1}}
+
+
+def test_report_oversized_file_is_truncated_and_flagged(env: Path):
+    code, rec, prov, _ = run_job(
+        env, outputs='[[outputs]]\npath = "result.txt"\n[[outputs]]\npath = "big.txt"\n',
+        extra='[report]\nfiles = ["big.txt"]\nmax_bytes = 100\n',
+        command=f"{HELLO}; for i in $(seq 1 50); do printf 0123456789 >> $GPUOPS_OUT/big.txt; done")
+    assert code == ExitCode.OK, rec.error
+    got = rec.report["big.txt"]
+    assert got["truncated"] is True and got["bytes"] == 500 and len(got["text"]) == 100
+
+
+def test_report_file_that_is_not_valid_json_comes_back_as_text(env: Path):
+    code, rec, prov, _ = run_job(
+        env, outputs=TWO_OUTPUTS, extra='[report]\nfiles = ["metrics.json"]\n',
+        command=f"{HELLO}; echo not-json-at-all > $GPUOPS_OUT/metrics.json")
+    assert code == ExitCode.OK, rec.error
+    assert rec.report["metrics.json"]["text"].strip() == "not-json-at-all"
+    assert "parse_error" in rec.report["metrics.json"]
+
+
+def test_report_missing_optional_file_is_null_with_a_note(env: Path):
+    code, rec, prov, _ = run_job(
+        env, outputs='[[outputs]]\npath = "result.txt"\n[[outputs]]\npath = "maybe.json"\nrequired = false\n',
+        extra='[report]\nfiles = ["maybe.json"]\n', command=HELLO)
+    assert code == ExitCode.OK, rec.error
+    assert rec.report == {"maybe.json": None}
+    assert any("report file missing" in n for n in rec.notes)
+
+
+def test_report_is_omitted_when_outputs_are_not_verified(env: Path):
+    code, rec, prov, _ = run_job(
+        env, remote_cls=CorruptingRemote, outputs=TWO_OUTPUTS, extra='[report]\nfiles = ["metrics.json"]\n',
+        command=f'{HELLO}; printf \'{{"eval_loss": 0.42}}\' > $GPUOPS_OUT/metrics.json')
+    assert code == ExitCode.TRANSFER_FAILED
+    assert rec.report is None  # never read from data gpu-ops could not verify
+    assert any("report omitted" in n for n in rec.notes)
+
+
+def test_report_never_carries_a_secret(env: Path):
+    """The secret holds a quote and a backslash, so it reaches the file JSON-escaped.
+
+    Redacting the raw text would miss it: the file holds `pa\\"ss`, never the literal value.
+    Redaction therefore runs over the parsed structure at the boundary.
+    """
+    secret = 'pa"ss\\word-123'
+    code, rec, prov, runner = run_job(
+        env, secrets={"TOKEN": secret}, outputs=TWO_OUTPUTS, extra='[report]\nfiles = ["metrics.json"]\n',
+        command=f'{HELLO}; python3 -c \'import json,os; print(json.dumps({{"tok": os.environ["TOKEN"]}}))\''
+                ' > $GPUOPS_OUT/metrics.json')
+    assert code == ExitCode.OK, rec.error
+    assert rec.report["metrics.json"]["tok"] == "***", rec.report
+    assert secret not in json.dumps(rec.report)
+    assert secret not in (runner.run_dir / "record.json").read_text()
+
+
+def test_phase_markers_are_written_to_the_job_log(env: Path):
+    code, rec, prov, runner = run_job(env, setup="echo setting-up", command="echo working; " + HELLO)
+    assert code == ExitCode.OK, rec.error
+    log = (runner.run_dir / "job.log").read_text()
+    assert "[gpu-ops] phase: setup" in log and "[gpu-ops] phase: command" in log
+    assert log.index("setting-up") < log.index("[gpu-ops] phase: command")
+
+
+def test_a_note_from_a_provider_error_is_redacted(env: Path):
+    """notes reach record.json and the result, so they go through the same per-field scrub.
+
+    `list_raises` is what actually produces the `teardown error: {e!r}` note: teardown()
+    swallows its own exceptions, so terminate_failures never reaches that path.
+    """
+    secret = "s3cr3t-value-123"
+    code, rec, prov, runner = run_job(env, secrets={"TOKEN": secret},
+                                      provider_kw={"fail_create": True, "list_raises": secret})
+    assert code == ExitCode.TEARDOWN_FAILED
+    assert any("teardown error" in n for n in rec.notes), rec.notes  # the note really happened
+    assert secret not in json.dumps(rec.notes) and "***" in json.dumps(rec.notes)
+    assert secret not in (runner.run_dir / "record.json").read_text()
+
+
+def test_a_secret_that_looks_like_a_field_name_does_not_break_the_record(env: Path):
+    """Redaction is per field, so a secret can never rename one.
+
+    Scrubbing keys as well as values lost the record of a paid-for run (TypeError on
+    rebuild, after teardown) and silently wrote `***_estimate_usd` for a secret `cost`.
+    """
+    code, rec, prov, runner = run_job(env, secrets={"TOKEN": "tier", "OTHER": "cost"},
+                                      command="echo hi > $GPUOPS_OUT/result.txt")
+    assert code == ExitCode.OK, rec.error
+    saved = json.loads((runner.run_dir / "record.json").read_text())
+    assert saved["tier"] == "community" and saved["cost_estimate_usd"] is not None
+    assert not any("*" in k for k in saved)
+
+
+def test_report_read_when_a_spec_declares_no_outputs(env: Path):
+    """The no-outputs path used to skip the report and then claim it was omitted."""
+    code, rec, prov, _ = run_job(env, command="true", outputs="", extra='[report]\nfiles = []\n')
+    assert code == ExitCode.OK, rec.error
+    assert rec.report == {}
+    assert not any("report omitted" in n for n in rec.notes)
+
+
+def test_a_secret_in_a_file_name_is_redacted_too(env: Path):
+    """The existing secret tests put secrets in file *contents*; paths are keys, and keys leak.
+
+    inputs-manifest.json is keyed by input path, and outputs_manifest by the paths the job
+    chose under $GPUOPS_OUT. Both reach disk, and outputs_manifest reaches `--full`.
+    """
+    secret = "s3cr3tname"
+    (env / "data").mkdir(exist_ok=True)  # write_spec also creates it, but we get there first
+    (env / "data" / f"{secret}.csv").write_text("rows\n")
+    code, rec, prov, runner = run_job(
+        env, secrets={"TOKEN": secret}, outputs='[[outputs]]\npath = "d"\n',
+        command=f"mkdir -p $GPUOPS_OUT/d; echo hi > $GPUOPS_OUT/d/{secret}.txt")
+    assert code == ExitCode.OK, rec.error
+
+    manifest = (runner.run_dir / "inputs-manifest.json").read_text()
+    assert secret not in manifest and "***" in manifest
+    assert secret not in (runner.run_dir / "record.json").read_text()
+    assert any("***" in k for k in rec.outputs_manifest), rec.outputs_manifest

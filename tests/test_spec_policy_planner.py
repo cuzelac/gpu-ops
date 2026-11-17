@@ -143,3 +143,57 @@ def test_month_spend_counts_killed_runs_like_spend():
     finished = {"started_at": "2026-11-12T10:00:00+00:00", "ended_at": "2026-11-12T10:10:00+00:00",
                 "instance_id": "f", "cost_estimate_usd": 0.05}
     assert month_spend([killed, finished], now) == pytest.approx(0.01 + 0.05, abs=1e-6)
+
+
+def test_report_file_must_also_be_an_output(env: Path):
+    spec = write_spec(env, extra='[report]\nfiles = ["metrics.json"]\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert e.value.code == ExitCode.SPEC_INVALID and "must also be listed in [[outputs]]" in e.value.message
+
+
+def test_report_max_bytes_is_capped(env: Path):
+    spec = write_spec(env, outputs='[[outputs]]\npath = "result.txt"\n',
+                      extra='[report]\nfiles = ["result.txt"]\nmax_bytes = 999999\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert e.value.code == ExitCode.SPEC_INVALID
+
+
+def test_report_defaults(env: Path):
+    loaded = load_spec(write_spec(env, outputs='[[outputs]]\npath = "result.txt"\n',
+                                  extra='[report]\nfiles = ["result.txt"]\n'))
+    assert loaded.spec.report.max_bytes == 16384
+
+
+def test_overlapping_outputs_rejected(env: Path):
+    """Two outputs where one contains the other would be counted twice in the result."""
+    spec = write_spec(env, outputs='[[outputs]]\npath = "lora"\n[[outputs]]\npath = "lora/adapter"\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert "is inside output" in e.value.message
+
+
+def test_duplicate_outputs_rejected(env: Path):
+    spec = write_spec(env, outputs='[[outputs]]\npath = "a.txt"\n[[outputs]]\npath = "a.txt"\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert "must be unique" in e.value.message
+
+
+def test_report_budget_is_bounded_in_total_not_just_per_file(env: Path):
+    """16 files x 64 KiB would be 1 MB inside a result advertised as compact."""
+    files = ", ".join(f'"f{i}.txt"' for i in range(16))
+    outs = "".join(f'[[outputs]]\npath = "f{i}.txt"\n' for i in range(16))
+    spec = write_spec(env, outputs=outs, extra=f'[report]\nfiles = [{files}]\nmax_bytes = 65536\n')
+    with pytest.raises(GpuOpsError) as e:
+        load_spec(spec)
+    assert "the limit is" in e.value.message
+
+
+def test_report_within_budget_loads(env: Path):
+    files = ", ".join(f'"f{i}.txt"' for i in range(4))
+    outs = "".join(f'[[outputs]]\npath = "f{i}.txt"\n' for i in range(4))
+    loaded = load_spec(write_spec(env, outputs=outs,
+                                  extra=f'[report]\nfiles = [{files}]\nmax_bytes = 16384\n'))
+    assert len(loaded.spec.report.files) == 4

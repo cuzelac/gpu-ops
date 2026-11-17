@@ -57,7 +57,7 @@ def test_run_with_directory_include(env: Path):
         extra='[[inputs]]\nname = "d"\nfrom = "data"\ninclude = ["a.txt", "sub"]\n',
         command="cat $GPUOPS_IN/d/sub/b.txt > $GPUOPS_OUT/result.txt")
     assert code == ExitCode.OK, rec.error
-    assert set(rec.inputs_manifest) == {"d/a.txt", "d/sub/b.txt"}
+    assert set(runner.inputs_manifest) == {"d/a.txt", "d/sub/b.txt"}  # off the record now
     assert (runner.run_dir / "out" / "result.txt").read_text() == "beta\n"
     assert_nothing_alive(prov)
 

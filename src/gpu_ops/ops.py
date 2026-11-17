@@ -42,7 +42,16 @@ def kill(providers: dict[str, Provider], instance_ids: list[str] | None, *, all_
          timeout_s: float = 300) -> list[dict]:
     results = []
     for pname, p in providers.items():
-        for inst in p.list_instances(PREFIX):
+        try:
+            live = p.list_instances(PREFIX)
+        except Exception as e:
+            # a provider we cannot query may be holding live machines, and the caller must
+            # still learn what the other providers did: report it as a failure, never raise
+            # past the results we already have
+            results.append({"provider": pname, "id": None, "name": None, "terminated": False,
+                            "note": f"could not list instances: {type(e).__name__}: {e}"})
+            continue
+        for inst in live:
             if all_ or (instance_ids and inst.id in instance_ids):
                 ok = teardown(p, inst.id, timeout_s)
                 results.append({"provider": pname, "id": inst.id, "name": inst.name, "terminated": ok})
@@ -78,7 +87,14 @@ def reap(providers: dict[str, Provider], *, grace_min: float, max_age_min: float
     now = datetime.now(timezone.utc)
     results = []
     for pname, p in providers.items():
-        for inst, why in reap_decisions(p.list_instances(PREFIX), now, grace_min=grace_min, max_age_min=max_age_min):
+        try:
+            live = p.list_instances(PREFIX)
+        except Exception as e:  # as in kill(): an unqueryable provider is a result, not a raise
+            results.append({"provider": pname, "id": None, "name": None, "reason": "provider unreachable",
+                            "terminated": False, "dry_run": dry_run,
+                            "note": f"could not list instances: {type(e).__name__}: {e}"})
+            continue
+        for inst, why in reap_decisions(live, now, grace_min=grace_min, max_age_min=max_age_min):
             ok = None if dry_run else teardown(p, inst.id, timeout_s)
             results.append({"provider": pname, "id": inst.id, "name": inst.name, "reason": why,
                             "terminated": ok, "dry_run": dry_run})

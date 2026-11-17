@@ -74,6 +74,10 @@ required = true
 path = "lora/train-record.json"
 required = true                   # success = required outputs exist and checksums match, not exit code alone
 
+[report]                          # optional: small output files whose contents come back in the result
+files = ["lora/train-record.json"]
+max_bytes = 16384                 # per file; default 16 KiB, hard max 64 KiB
+
 [gpu]
 min_vram_gb = 24
 count = 1
@@ -158,12 +162,17 @@ src/gpu_ops/
 11. **Execute:**
     - Run `setup`, then `command`, over SSH.
     - Secrets go into that process's environment only.
-    - Output streams to `runs/<id>/job.log`, which is redacted.
+    - Output streams to `runs/<id>/job.log`, which is redacted and carries a `[gpu-ops] phase: …` marker
+      per phase, so `gpu-ops logs --phase` can split it.
+    - It does **not** stream to stderr unless stderr is a terminal (phase lines) or `--progress` is given
+      (phase lines and the job's output). An agent pays for every byte it reads.
     - The local timer enforces the deadline and kills the command at it.
 12. **Collect:**
     - Build a manifest of `/gpuops/out` on the instance, then rsync it down.
     - Verify every hash locally.
     - A missing required output, or any mismatch, is a failure. Downloaded files are kept and marked unverified.
+    - Only then: read the `[report]` files from the verified local copies into the record. Unverified data
+      never reaches the result.
 13. **Teardown** (in `finally`, and on SIGINT and SIGTERM):
     - Call `terminate`, then confirm with `get` that the instance is gone. Retry with backoff for up to 5 minutes.
     - If that still fails: exit 10, print `TEARDOWN FAILED — INSTANCE MAY STILL BE BILLING: <id>`, and leave the ledger entry `live`.
@@ -171,7 +180,10 @@ src/gpu_ops/
     - provider, GPU, tier, data centre, image digest
     - start, end and billed seconds
     - estimated cost; the provider-reported cost is filled in later by `spend --reconcile`
-    - inputs hash, output manifest, exit code
+    - inputs hash and input file count, output manifest, exit code
+      (the per-file input hashes go to `inputs-manifest.json`, not the record: one entry per file would
+      swamp a record for a dataset of thousands of files, and nothing reads them after upload)
+    - the `[report]` file contents, if the spec asked for any
     - whether the dead-man timer was armed
     - the job kind and project
 
@@ -256,6 +268,49 @@ Each layer covers the failure of the one before it.
 ## 5. Agent interface and docs
 
 - **Machine-readable output:** every command accepts `--json` and returns one documented shape, `{ok, exit_code, run_id, ...}`.
+- **Short by default, because tokens are the agent's cost:**
+  - `run` prints a compact result (~20 lines): status, GPU, cost, teardown, outputs with their sizes, notes,
+    and `report`. On failure it adds `log_tail`, the last 20 lines of `job.log`. `--full` returns the whole record.
+  - Hashes are the clearest example of the problem: a per-file manifest is proof gpu-ops needs and an agent
+    does not. Output hashes stay in the record (`--full`); input hashes moved to their own file.
+  - `[report]` carries the job's own numbers — eval loss, counts, peak memory — so reading results costs no
+    extra tool calls. It is read only from outputs whose checksums matched.
+  - `--get PATH[,PATH]` returns just the named fields, so an agent never writes a one-off JSON parser.
+  - `gpu-ops logs RUN_ID [--tail N] [--grep REGEX] [--phase setup|command]` pulls only the log lines wanted.
+- **Each rule lives on the data or the signature that owns it.** Three review rounds taught this the
+  expensive way: every rule given a *type or a validator* stayed fixed, and every rule given a *convention* —
+  a helper to opt into, a scrubber to choose, a tolerance to remember — came back at a new site in the next
+  round. So:
+  - **Nothing persisted or printed holds a secret.** `RunRecord` declares the policy per field
+    (`metadata={"redact": "value" | "keys+values" | "none"}`); `Redactor.scrub_record` applies it with
+    `dataclasses.replace`, and `Ledger.write_record` is the only applier — it returns the record it wrote, so
+    a caller uses that instead of redacting its own copy. Field *names* are never rewritten: scrubbing keys
+    renamed `cost_estimate_usd` for a secret `cost`, and for a secret `tier` raised after teardown and before
+    the write, losing the record of a run that had already spent money. Where the keys really are the job's
+    (`report`, `outputs_manifest`) the field says `keys+values`. `job.log` keeps per-line redaction because it
+    is written as it streams, and `inputs-manifest.json` uses `scrub_tree` because there the keys are the paths
+    and the values are only hashes.
+  - **The result decides the exit code; printing cannot.** `cli._finish` takes a callback that returns the
+    result, and reads the code back out of it, so the two cannot disagree and a command cannot leave the
+    statement that computes its own code outside the guard — which `kill`, `reap` and `spend` all used to do
+    *after* terminating instances or writing to disk. A deliberate `GpuOpsError` keeps its own code; an
+    unexpected failure in the work reports a conservative fallback (exit 10 for `kill`/`reap`: gpu-ops cannot
+    claim the machines are gone); a failure in *printing* keeps the command's code and prints the whole result,
+    because on exit 10 that payload says which machines are alive. A caller's own bad `--get` path on a clean
+    command is still exit 2, as AGENTS.md documents.
+  - **Every result carries `ok` and `exit_code`,** because `result.result()` supplies them rather than ten
+    commands copying them correctly.
+  - **The result is bounded.** `result.compact` sizes *declared* outputs and collapses a directory to its
+    bytes and file count; the spec refuses overlapping or duplicate outputs (which would double-count) and
+    caps `[report]`'s `files × max_bytes` in total. The bad states are unrepresentable rather than handled.
+  - **Read only what you need.** `result.tail_lines` streams a bounded buffer, `read_head_bytes` reads to a
+    cap, and `Ledger.current` streams an append-only file, so nothing materializes a whole file to return a
+    slice of it. Those readers raise `GpuOpsError`, never a bare `OSError`, so a missing file never surfaces
+    as "internal error".
+  - **A reader tolerates what it did not write.** `Ledger.records`, `Ledger.current`, the reconcile loop and
+    `spend.summarize` all skip what they cannot parse and *report the count* rather than failing a free
+    command. `Ledger.patch_record` takes the file it read, not the `run_id` inside it — those can disagree,
+    and resolving the path from the field wrote a second record and left the first unpatched forever.
 - **No interactive prompts anywhere.**
 - **Spend gate** (`docs/claude-settings-snippet.json`), merged into the user-level `~/.claude/settings.json` so one copy covers every project. Verified 2026-11-17:
   - Allow every `gpu-ops` command, by bare name and through the `bin/` wrappers.
