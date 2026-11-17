@@ -51,5 +51,8 @@ If the token leaks, revoke the service account in 1Password; nothing else needs 
 | Remove it | `bin/gpuops-credential.ps1 remove`. gpu-ops goes back to desktop-app prompts |
 | Turn it off for one command | `GPUOPS_NO_SERVICE_ACCOUNT=1 gpu-ops …` |
 
-- **If the service account read fails** (revoked token, item moved), gpu-ops prints the reason on stderr and falls back to the desktop app.
+- **If the service account read fails** (revoked token, item moved, wrong clock), gpu-ops prints the reason on stderr and falls back to the desktop app, which may ask for your password.
+- **Unattended callers never fall back.** With `GPUOPS_NO_DESKTOP_FALLBACK=1`, a failed service-account read is exit 3 instead of a password prompt. The scheduled reaper sets this, so it notifies you rather than popping up 1Password dialogs at startup or while you're away.
+- **`failed to re-initialize service account session`** almost always means **the system clock is wrong**. Seen 2026-11-17: after a crash, Windows' clock was hours behind, and WSL inherited it. The token and rate limits were fine. Fix the clock (resync NTP); checking that WSL and Windows agree proves nothing, since both can be wrong together.
+- **Check usage and limits:** run `op service-account ratelimit gpu-ops` in a terminal where 1Password is unlocked.
 - **Rate limits:** 1Password's published limit for individual accounts is 1,000 service-account reads a day ([rate limits](https://developer.1password.com/docs/service-accounts/rate-limits/)). Each gpu-ops command uses one. A reaper every 30 minutes uses about 50 a day.

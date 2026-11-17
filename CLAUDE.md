@@ -24,4 +24,5 @@ Users of the CLI (including agents running GPU jobs) read AGENTS.md; this file i
 - SSH sessions on a pod don't inherit the container env; bootstrap saves `RUNPOD_*` to `/gpuops/.provider_env` for the dead-man timer.
 - Claude desktop sessions (MSIX) see a private copy of files they write under `AppData\Local`; read Windows-side files such as `reaper.log` via WSL `/mnt/c/...`.
 - To prove a 1Password read used the service account, set `GPUOPS_OP_BIN=/bin/false` so the desktop fallback can't succeed.
+- `failed to re-initialize service account session` from `op` = the system clock is wrong (seen after a crash left Windows' clock hours behind; WSL inherits it). Comparing WSL against Windows proves nothing; check against real time and resync NTP.
 - Repo files are LF. Writing one with Windows Python (`Path.write_text`) rewrites it CRLF and the diff becomes the whole file; write bytes, or normalize `\r\n` → `\n` afterwards.

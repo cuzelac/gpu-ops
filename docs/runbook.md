@@ -39,7 +39,9 @@ For example, 1Password won't unlock or WSL is broken:
   - The run that started them didn't clean up, and neither did its dead-man timer. Find the run in `gpu-ops spend` / `~/.local/state/gpu-ops/runs/` and look at its `record.json` and `job.log`.
   - Then run `gpu-ops ps` to confirm nothing is left.
 - **"reaper FAILED (exit 3)":**
-  - It couldn't read the RunPod key. Check the service account with `bin\gpuops-credential.ps1 test` and [docs/unattended.md](unattended.md).
+  - It couldn't read the RunPod key through the 1Password service account. **Check the system clock first.** A wrong clock (e.g. after a crash) breaks service-account sign-in with `failed to re-initialize service account session`.
+  - Then check the token with `bin\gpuops-credential.ps1 test`, and usage with `op service-account ratelimit gpu-ops`. More in [docs/unattended.md](unattended.md).
+  - The reaper never falls back to a 1Password password prompt; it only logs and notifies.
   - Until it's fixed, check `gpu-ops ps` yourself.
 - **Any other failure:**
   - Run `gpu-ops ps`, and use the console (step 2) if gpu-ops can't reach RunPod.
