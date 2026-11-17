@@ -35,6 +35,28 @@ def _cost(r: dict) -> float:
     return r.get("cost_estimate_usd") or 0.0
 
 
+def _derive(r: dict) -> dict:
+    """Everything `summarize` needs from one record, computed before anything is committed.
+
+    Raises if a field is not the type this version expects — including the arithmetic, which
+    is forced here rather than left to the caller's `+=`. The caller counts the record as
+    unreadable and commits nothing, so no record can be half-counted.
+    """
+    secs = _upper_bound(r)[1] if _unfinished(r) else (r.get("billed_seconds") or 0)
+    phases = r.get("phases") or {}
+    return {
+        "cost": _cost(r) + 0.0,
+        "hours": secs / 3600 * (r.get("gpu_count") or 1) + 0.0,
+        "unfinished": int(_unfinished(r)),
+        "command_s": phases.get("command", 0) + 0.0,
+        "overhead_s": sum(v for k, v in phases.items() if k != "command") + 0.0,
+        "not_replaceable": int((r.get("vram_gb") or 0) > SINGLE_CARD_VRAM_GB or (r.get("gpu_count") or 1) > 1),
+        "unreconciled": int(r.get("cost_billed_usd") is None and bool(r.get("instance_id"))),
+        "by": (("month", r["started_at"][:7]), ("provider", r.get("provider")),
+               ("project", r.get("project")), ("kind", r.get("kind")), ("gpu", r.get("gpu_name"))),
+    }
+
+
 def summarize(records: list[dict], policy: Policy | None, now: datetime | None = None) -> dict:
     """Totals over the run records. Tolerates a record it did not write.
 
@@ -55,29 +77,25 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
     unreconciled = 0
     unfinished = 0
     for r in recs:
-      try:
-        cost = _cost(r)
-        secs = _upper_bound(r)[1] if _unfinished(r) else (r.get("billed_seconds") or 0)
-        unfinished += _unfinished(r)
-        hours = secs / 3600 * (r.get("gpu_count") or 1)
-        month = r["started_at"][:7]
-        for key, val in (("month", month), ("provider", r.get("provider")), ("project", r.get("project")),
-                         ("kind", r.get("kind")), ("gpu", r.get("gpu_name"))):
+        try:
+            row = _derive(r)
+        except (TypeError, ValueError, AttributeError, KeyError, IndexError):
+            unreadable += 1  # a field that is not the type this version expects
+            continue
+        # from here nothing can raise, so a record is either counted everywhere or nowhere.
+        # Tolerating a failure *mid-commit* is how `runs: 0` once shipped beside `total: 7.5`.
+        unfinished += row["unfinished"]
+        for key, val in row["by"]:
             b = by[key][val or "?"]
-            b["usd"] += cost
-            b["gpu_hours"] += hours
+            b["usd"] += row["cost"]
+            b["gpu_hours"] += row["hours"]
             b["runs"] += 1
-        total += cost
-        gpu_hours_total += hours
-        phases = r.get("phases") or {}
-        command_s += phases.get("command", 0)
-        overhead_s += sum(v for k, v in phases.items() if k != "command")
-        if (r.get("vram_gb") or 0) > SINGLE_CARD_VRAM_GB or (r.get("gpu_count") or 1) > 1:
-            not_replaceable += 1
-        if r.get("cost_billed_usd") is None and r.get("instance_id"):
-            unreconciled += 1
-      except (TypeError, ValueError, AttributeError, KeyError):
-        unreadable += 1  # a field that is not the type this version expects
+        total += row["cost"]
+        gpu_hours_total += row["hours"]
+        command_s += row["command_s"]
+        overhead_s += row["overhead_s"]
+        not_replaceable += row["not_replaceable"]
+        unreconciled += row["unreconciled"]
 
     # trailing 3 calendar months including this one
     months = []

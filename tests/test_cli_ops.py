@@ -15,7 +15,7 @@ import pytest
 
 from gpu_ops.errors import ExitCode
 from gpu_ops.names import PREFIX, instance_name, new_run_id
-from gpu_ops.ops import reap_decisions
+from gpu_ops.ops import kill, reap, reap_decisions
 from gpu_ops.policy import Policy
 from gpu_ops.providers.base import CreateRequest, Instance
 from gpu_ops.providers.fake import DEFAULT_OFFERS, FakeProvider
@@ -198,7 +198,8 @@ def test_a_bad_get_path_never_overwrites_a_failed_run_exit_code(env: Path):
     # and the WHOLE result is printed, not a stub: the payload is the point of keeping the
     # code, so assert the payload too
     assert out["teardown_confirmed"] is True and "log_tail" in out
-    assert "about to fail" not in out.get("error", "") or True
+    # the real result, not a stub: a stub's error would be about rendering, not the job
+    assert "exited with code 3" in out["error"]
     assert set(out) >= COMPACT_FIELDS
 
 
@@ -413,3 +414,44 @@ def test_spend_counts_a_record_it_cannot_read_separately(env: Path):
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["unreadable_records"] == 1 and out["runs"] == 0
+
+
+class _Unqueryable:
+    """A provider whose listing fails — an API 500, an expired key, a network blip."""
+    name = "broken"
+
+    def list_instances(self, prefix):
+        raise RuntimeError("API 500")
+
+
+def test_kill_reports_a_provider_it_cannot_query(env: Path):
+    """An unqueryable provider may be holding live machines: say so, do not raise."""
+    prov = FakeProvider(env / "fake")
+    prov.create(CreateRequest(name=instance_name(new_run_id(), 1, "a"), offer=DEFAULT_OFFERS[0],
+                              image="x", bootstrap="", public_key=""))
+
+    res = kill({"fake": prov, "broken": _Unqueryable()}, None, all_=True)
+
+    terminated = [r for r in res if r.get("terminated") is True]
+    broken = [r for r in res if r.get("provider") == "broken"]
+    assert len(terminated) == 1  # the provider that answered still got cleaned up and reported
+    assert len(broken) == 1 and "could not list instances" in broken[0]["note"]
+    # terminated is False, which is what cmd_kill turns into exit 10 ("may still be billing")
+    assert broken[0]["terminated"] is False
+
+
+def test_reap_reports_a_provider_it_cannot_query(env: Path):
+    res = reap({"broken": _Unqueryable()}, grace_min=10, max_age_min=370, dry_run=True)
+    assert len(res) == 1 and res[0]["terminated"] is False
+    assert "could not list instances" in res[0]["note"]
+
+
+def test_summarize_counts_a_record_everywhere_or_nowhere():
+    """Tolerating a failure mid-commit once produced `runs: 0` beside `total_usd: 7.5`."""
+    from gpu_ops.spend import summarize
+    bad = {"started_at": "2026-11-01T10:00:00+00:00", "cost_estimate_usd": 7.5,
+           "billed_seconds": 3600, "gpu_count": 1, "phases": [1, 2]}  # phases is not a dict
+    s = summarize([bad], None, datetime(2026, 11, 20, tzinfo=timezone.utc))
+    assert s["unreadable_records"] == 1 and s["runs"] == 0
+    assert s["total_usd"] == 0.0 and s["gpu_hours"] == 0.0
+    assert s["by"]["month"] == {}  # and nothing was committed to the buckets either

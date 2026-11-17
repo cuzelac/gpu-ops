@@ -73,6 +73,9 @@ Every input file is hashed. The hashes are checked again on the machine after up
 - Each file is hashed on the machine and checked after download (exit 7 on a mismatch).
 - Paths must be unique, and one output may not sit inside another (`lora` and `lora/adapter` is an
   error): the run result reports a size per declared output, and overlapping ones would double-count.
+- **Never put a secret in an output path.** It would be in this file in plain text anyway, and the run
+  result redacts the paths it reports, so the output would not be matched back to what you declared and
+  would be missing from `outputs`.
 
 ### `[report]` (optional)
 
