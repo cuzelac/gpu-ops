@@ -48,8 +48,10 @@ if ($TestToast) {
 
 $reapArgs = if ($DryRun) { 'reap --json --dry-run' } else { 'reap --json' }
 # stdout = the JSON result; stderr goes to a WSL-side log so it can't corrupt the JSON
-# full path, not bare `gpu-ops`: WSL appends the Windows PATH, which may contain this bin folder
-$out = & wsl.exe -e bash -lc "~/.local/bin/gpu-ops $reapArgs 2>>~/.local/state/gpu-ops/reaper-stderr.log"
+# full path, not bare `gpu-ops`: WSL appends the Windows PATH, which may contain this bin folder.
+# GPUOPS_NO_DESKTOP_FALLBACK=1: if the service account fails, fail (and notify) instead of popping a
+# 1Password password prompt at whoever is, or isn't, at the screen.
+$out = & wsl.exe -e bash -lc "GPUOPS_NO_DESKTOP_FALLBACK=1 ~/.local/bin/gpu-ops $reapArgs 2>>~/.local/state/gpu-ops/reaper-stderr.log"
 $code = $LASTEXITCODE
 $text = ($out | Out-String).Trim()
 
@@ -73,7 +75,7 @@ if ($code -eq 0 -and $null -ne $result) {
     $why = if ($null -ne $result -and $result.error) { $result.error } elseif ($text) { $text.Substring(0, [Math]::Min(300, $text.Length)) } else { 'no output' }
     Write-Log "FAILED (exit $code): $why"
     $hint = switch ($code) {
-        3       { 'Could not read the RunPod key (1Password service account?).' }
+        3       { 'Could not read the RunPod key via the 1Password service account. Check the system clock first (a wrong clock breaks service-account sign-in); details in reaper.log.' }
         10      { 'A machine could not be deleted and may still be billing.' }
         default { 'A machine may still be billing.' }
     }

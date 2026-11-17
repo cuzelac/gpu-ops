@@ -86,6 +86,7 @@ A Windows scheduled task, `\gpu-ops\gpu-ops reaper`, runs `gpu-ops reap` every 3
 - **Hidden** (`conhost --headless`), so no window appears.
 - **One copy at a time,** stopped after 10 minutes. It runs on battery, and catches up after sleep.
 - **Quiet unless something happens:** it shows a **Windows notification** only if it deleted something or failed. They appear under "Windows PowerShell".
+- **Never prompts.** If the 1Password service account fails, the reaper fails with exit 3 and notifies you. It doesn't fall back to a 1Password password dialog (`GPUOPS_NO_DESKTOP_FALLBACK=1`).
 
 **Managing it** (in PowerShell):
 

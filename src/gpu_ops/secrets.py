@@ -13,7 +13,10 @@ Two ways to read, tried in this order:
    op binary: $GPUOPS_OP_BIN, else op.exe on PATH (the Windows CLI, which unlocks through the desktop app),
    else `op` on PATH.
 
-If the service account read fails, gpu-ops says so on stderr and falls back to the desktop app.
+If the service account read fails, gpu-ops says so on stderr and falls back to the desktop app,
+unless GPUOPS_NO_DESKTOP_FALLBACK=1: then it fails with exit 3 instead. Unattended callers (the
+scheduled reaper) set this, because a desktop-app password prompt with nobody at the screen helps
+no one and pops up at odd times.
 """
 
 from __future__ import annotations
@@ -169,6 +172,7 @@ def read_op(ref: str, redactor: Redactor | None = None) -> str:
     if not ref.startswith("op://"):
         raise GpuOpsError(ExitCode.SPEC_INVALID, f"not a 1Password reference: {ref!r}")
 
+    no_fallback = os.environ.get("GPUOPS_NO_DESKTOP_FALLBACK") == "1"
     token = service_account_token()
     if token:
         if redactor is not None:
@@ -182,8 +186,19 @@ def read_op(ref: str, redactor: Redactor | None = None) -> str:
         except subprocess.TimeoutExpired:
             why = "timed out after 60 s"
         why = redactor(why) if redactor is not None else why.replace(token, "***")
+        if "re-initialize service account session" in why:
+            # seen 2026-11-17: a system clock left wrong after a crash made every service-account
+            # sign-in fail this way until NTP was resynced
+            why += " (check the system clock: 1Password rejects service-account sign-in when it is wrong)"
+        if no_fallback:
+            raise GpuOpsError(ExitCode.REFUSED, f"service account could not read {ref}: {why}. "
+                                                "Desktop-app fallback is off (GPUOPS_NO_DESKTOP_FALLBACK=1).")
         print(f"gpu-ops: service account could not read {ref} ({why}); falling back to the 1Password app",
               file=sys.stderr)
+    elif no_fallback:
+        raise GpuOpsError(ExitCode.REFUSED, f"no 1Password service account token is available to read {ref}, and "
+                                            "desktop-app fallback is off (GPUOPS_NO_DESKTOP_FALLBACK=1). "
+                                            "See docs/unattended.md.")
 
     try:
         r = _run_op(op_binary(), ref, None, timeout=120)

@@ -72,3 +72,38 @@ def test_desktop_failure_is_exit_3(tmp_path, monkeypatch):
     with pytest.raises(GpuOpsError) as e:
         S.read_op("op://v/i/f")
     assert e.value.code == ExitCode.REFUSED and "authorization timeout" in e.value.message
+
+
+def test_no_fallback_fails_instead_of_prompting(ops, monkeypatch):
+    sa, desk = ops
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_wrong-token-value")
+    monkeypatch.setenv("GPUOPS_NO_DESKTOP_FALLBACK", "1")
+    with pytest.raises(GpuOpsError) as e:
+        S.read_op("op://v/i/f")
+    assert e.value.code == ExitCode.REFUSED and "fallback is off" in e.value.message
+    assert "ops_wrong-token-value" not in e.value.message
+    assert not Path(f"{desk}.argv").exists()  # the desktop app was never asked
+
+
+def test_no_fallback_without_token_fails(ops, monkeypatch):
+    sa, desk = ops
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.setattr(S, "_load_service_account_token", lambda: None)
+    monkeypatch.setenv("GPUOPS_NO_DESKTOP_FALLBACK", "1")
+    with pytest.raises(GpuOpsError) as e:
+        S.read_op("op://v/i/f")
+    assert e.value.code == ExitCode.REFUSED and "no 1Password service account token" in e.value.message
+    assert not Path(f"{desk}.argv").exists()
+
+
+def test_session_failure_mentions_clock(tmp_path, monkeypatch):
+    msg = "[ERROR] could not read secret: error initializing client: failed to re-initialize service account session"
+    sa = fake_op(tmp_path / "op-sa", f'echo "{msg}" >&2; exit 1\n')
+    monkeypatch.setenv("GPUOPS_OP_SA_BIN", str(sa))
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", TOKEN)
+    monkeypatch.setenv("GPUOPS_NO_DESKTOP_FALLBACK", "1")
+    monkeypatch.delenv("GPUOPS_NO_SERVICE_ACCOUNT", raising=False)
+    monkeypatch.setattr(S, "_sa_cache", S._UNSET)
+    with pytest.raises(GpuOpsError) as e:
+        S.read_op("op://v/i/f")
+    assert "check the system clock" in e.value.message
