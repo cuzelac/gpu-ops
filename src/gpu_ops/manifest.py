@@ -59,12 +59,16 @@ def parse_sha256sum(text: str) -> tuple[Manifest, list[str]]:
     return m, missing
 
 
-def compare(expected: Manifest, actual: Manifest) -> list[str]:
-    """Human-readable problems; empty list means identical."""
+def compare(expected: Manifest, actual: Manifest, *, missing: str = "missing locally") -> list[str]:
+    """Human-readable problems; empty list means identical.
+
+    `missing` says where an expected file is absent: "missing locally" when checking a download,
+    "did not arrive on the machine" when checking an upload.
+    """
     problems = []
     for k, v in expected.items():
         if k not in actual:
-            problems.append(f"missing locally: {k}")
+            problems.append(f"{missing}: {k}")
         elif actual[k] != v:
             problems.append(f"checksum mismatch: {k}")
     for k in actual.keys() - expected.keys():
