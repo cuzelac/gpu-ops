@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -177,3 +177,18 @@ class RunRecord:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RunRecord":
+        """Rebuild a record from one on disk, dropping fields this version does not know.
+
+        A reader tolerates what it did not write. `collect` runs long after the process that
+        wrote the record, possibly from a different gpu-ops version; whatever is dropped here
+        still survives on disk, because `patch_record` writes back only the fields that
+        changed rather than a rebuilt record.
+        """
+        known = {f.name for f in fields(cls)}
+        absent = [k for k in ("run_id", "job", "project", "kind", "spec_path") if not d.get(k)]
+        if absent:
+            raise GpuOpsError(ExitCode.INTERNAL, f"run record is missing {', '.join(absent)}")
+        return cls(**{k: v for k, v in d.items() if k in known})

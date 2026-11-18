@@ -30,6 +30,11 @@ class PolicyLimits(_Strict):
     allow_unarmed_deadman_minutes: float = Field(
         default=120, ge=0,
         description="Longest run allowed when the dead-man timer could not be armed on the instance.")
+    detached_collect_minutes: float = Field(
+        default=15, ge=1,
+        description="For `run --detach`: minutes kept back before the deadline for `gpu-ops collect` to bring "
+                    "the outputs home. The machine is deleted at the deadline and anything not collected by "
+                    "then is lost. Capped at half the run, so a generous window cannot starve the job.")
 
 
 class PolicyProviders(_Strict):
@@ -57,6 +62,7 @@ max_month_usd = 50.0            # this month's spend + a run's worst case must s
 max_job_minutes = 360
 max_concurrent = 2
 allow_unarmed_deadman_minutes = 120   # longest run allowed if the on-instance dead-man timer can't be armed
+detached_collect_minutes = 15         # time kept back before the deadline for `collect` on a --detach run
 
 [providers]
 allowed = ["runpod"]

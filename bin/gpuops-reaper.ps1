@@ -69,7 +69,12 @@ if ($code -eq 0 -and $null -ne $result) {
         $names = ($reaped | ForEach-Object { "$($_.id) ($($_.reason))" }) -join '; '
         $verb = if ($DryRun) { 'would delete' } else { 'deleted' }
         Write-Log "REAPED: $verb $($reaped.Count): $names"
-        Show-Toast 'gpu-ops reaper' "$($reaped.Count) machine(s) were past their deadline and $verb. The run that started them did not clean up; check its record."
+        # Name the runs: a detached run reaped before `gpu-ops collect` has lost its outputs
+        # for good, and that is worth telling the human about. The id is read out of the
+        # instance's own name, not the ledger -- the reaper never reads local state (design.md s4).
+        $runs = (@($reaped | ForEach-Object { $_.run_id } | Where-Object { $_ }) -join ', ')
+        $detail = if ($runs) { " Runs: $runs. If one was detached and not yet collected, its outputs are lost." } else { '' }
+        Show-Toast 'gpu-ops reaper' "$($reaped.Count) machine(s) were past their deadline and $verb. The run that started them did not clean up; check its record.$detail"
     }
 } else {
     $why = if ($null -ne $result -and $result.error) { $result.error } elseif ($text) { $text.Substring(0, [Math]::Min(300, $text.Length)) } else { 'no output' }

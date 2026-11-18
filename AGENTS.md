@@ -11,6 +11,9 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 3. **Never put a secret in a job spec.**
    - Secrets are `op://…` references under `[secrets]`. A literal value is rejected.
 4. **On exit 10, act at once.** Run `gpu-ops kill --all --json`, then tell the human. A machine may still be billing.
+   - **A detached run you never collect is the same problem.** `run --detach` leaves a machine
+     running. Always finish it with `collect` or `wait`; if you stop caring about one, `gpu-ops kill`
+     its instance. Never start a second `--detach` and forget the first.
 5. **Prefer `--json`** and branch on `exit_code`, never on message text.
    - Output is short by default. Use `--get` to pull single fields, and `--full` only when you need the whole record.
    - If the job writes its own metrics to a file, put that file in `[report]` and read `report` in the result,
@@ -34,7 +37,11 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 | `gpu-ops validate SPEC` | free | Checks the spec and that its inputs exist. |
 | `gpu-ops plan SPEC` | free | Picks an offer and prices the worst case against policy. Creates nothing. Same as `run --dry-run`. |
 | `gpu-ops run SPEC` | **money** | The full run: create, upload, setup, command, download and verify, then delete the machine. Blocks until done. Prints a compact result; `--full` prints the whole record, `--progress` streams the job's output to stderr. |
-| `gpu-ops logs RUN_ID` | free | Lines from a finished run's `job.log`. `--tail N` (default 200, `0` = all), `--grep REGEX`, `--phase setup\|command`. |
+| `gpu-ops run SPEC --detach` | **money** | Starts the job **on the machine** and returns its `run_id` within seconds. **The machine stays alive on purpose** — finish with `collect` or `wait`. Use this for anything longer than a few minutes. |
+| `gpu-ops status RUN_ID` | free | What a detached run is doing, in one small object. Changes nothing; always exit 0 if it could report. |
+| `gpu-ops wait RUN_ID` | **money while it waits** | Blocks until the job ends, then collects it. Streams nothing and prints one object. `--timeout S` gives up waiting (exit 11); `--poll S` sets the interval. |
+| `gpu-ops collect RUN_ID` | stops spend | Brings a detached run's outputs home, verifies them, and deletes the machine. Idempotent. Exit 11 if the job is still running (nothing touched). |
+| `gpu-ops logs RUN_ID` | free | Lines from a run's `job.log`. `--tail N` (default 200, `0` = all), `--grep REGEX`, `--phase setup\|command`. For a detached run still going it fetches the log from the machine; `source` says `local` or `instance`. |
 | `gpu-ops schema --get PATH` | free | `--get` drills into the schema, e.g. `--get 'schema.$defs.LimitsSpec.properties'`. |
 | `gpu-ops ps` | free | Live gpu-ops machines, as the provider reports them. |
 | `gpu-ops kill ID… \| --all` | stops spend | Deletes gpu-ops machines. Never touches machines without the `gpuops-` prefix. |
@@ -56,8 +63,16 @@ gpu-ops rents a cloud GPU, runs a job, brings the results home, and deletes the 
 | 7 | Upload/download failed, or checksums did not match | Outputs in `runs/<id>/out` are **unverified**. Do not use them. |
 | 8 | Time or cost cap hit; the job was killed | Raise the limits in the spec, within policy, after asking the human. |
 | 10 | **Teardown failed. A machine may still be billing** | `gpu-ops kill --all --json`, then tell the human immediately. |
+| 11 | A detached run is still going. Nothing was collected and the machine is alive on purpose | Not an error. Wait and call `collect` again, or `gpu-ops wait RUN_ID`. |
 
 When several things fail, 10 always wins. Otherwise the first failure is reported.
+
+**Exit 0 from `run --detach` does not mean the machine is gone.** For every other command exit 0
+means teardown was confirmed; for `--detach` it means the job started and the machine is
+*deliberately* still running. The detached result says so: `status` is `"running"` and
+`teardown_confirmed` is `null`. The run is only finished once `collect` or `wait` returns, and
+whatever is not collected before `collect_by` is **lost** — the dead-man timer deletes the
+machine with the outputs still on it.
 
 ## JSON shapes
 
@@ -125,7 +140,31 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
     including `phases`, `outputs_manifest` (path → hash), `inputs_hash`, `inputs_file_count` and `worst_case_usd`.
   - Per-file **input** hashes are not in the record at all; they are in `<run_dir>/inputs-manifest.json`.
   - Outputs land in `<run_dir>/out/<output path>`.
-- **`logs`:** `{"ok", "exit_code", "run_id", "path", "lines_in_file", "lines_matched", "lines": [...]}`.
+- **`run --detach`** prints the same keys as `run`, with `minutes`, `cost_estimate_usd`,
+  `teardown_confirmed` and `outputs_verified` all `null` because none of them is known yet, plus:
+  ```json
+  {"ok": true, "exit_code": 0, "run_id": "20261112T140915-7a06", "status": "running",
+   "detached": true, "instance_id": "abc123", "deadline": "2026-11-12T15:09:15+00:00",
+   "collect_by": "2026-11-12T14:54:15+00:00", "collect_window_min": 15.0,
+   "next": "gpu-ops status 20261112T140915-7a06"}
+  ```
+  `collect_by` is the one to watch: **after it, the outputs are gone.** The window is
+  `policy.limits.detached_collect_minutes` (default 15), capped at half the run.
+- **`status`** is small on purpose, so polling it is cheap:
+  ```json
+  {"ok": true, "exit_code": 0, "run_id": "20261112T140915-7a06", "status": "running",
+   "phase": "command", "instance_id": "abc123", "collected": false, "elapsed_min": 12.4,
+   "minutes_to_deadline": 47.6, "collect_by": "2026-11-12T14:54:15+00:00",
+   "cost_so_far_usd": 0.033, "job_exit_code": null, "last_log_line": "epoch 2 loss 0.91",
+   "error": null}
+  ```
+  `phase` is one of `setup`, `command`, `finished`, `died` (the process is gone without
+  finishing — usually the OOM killer), `gone` (the machine has been deleted, so the outputs are
+  lost), `collected`, or `unknown`. Every key is always present.
+- **`collect`** and **`wait`** print the same shape as `run`, because they finish the run.
+  Exit 11 means the job is still going and the machine was left completely alone.
+- **`logs`:** `{"ok", "exit_code", "run_id", "path", "source", "lines_in_file", "lines_matched", "lines": [...]}`.
+  `source` is `local`, or `instance` when the log was fetched from a detached run still going.
   Without `--json` it prints just the lines. A `RUN_ID` that is not a run id is exit 2, and nothing is created.
 - **`spend`:** also has `unreadable_records` (int) — records whose fields are not the shapes this version
   expects. They are left out of the totals and counted here rather than failing the command.
@@ -151,9 +190,14 @@ own output only with `--progress`. `runs/<id>/job.log` is always written either 
 ## Known limits (v1)
 
 - **Images:** Debian or Ubuntu based only. The machine installs `openssh-server`, `rsync` and `curl` at boot if they are missing.
-- **No serving jobs, sessions, detached runs or network volumes yet.**
+- **No serving jobs, sessions or network volumes yet.**
+- **Detached runs hold a concurrency slot.** A `--detach` run counts against
+  `policy.limits.max_concurrent` (default 2) from launch until `collect`, because that limit is
+  measured from the machines the provider says are alive. Two uncollected detached runs will
+  refuse the next `run` with exit 3 — `gpu-ops ps` shows them.
 - **1Password prompts:** without a service account ([docs/unattended.md](docs/unattended.md)), each gpu-ops call reads the provider key through the Windows 1Password app.
   - A call can fail with exit 3 ("authorization timeout") if nobody approves the prompt.
   - Tell the human rather than retrying in a loop.
 - **Dead-man timer:** verified on RunPod 2026-11-12. If `record.deadman` is `unarmed`, `record.notes` says what was missing.
 - **Killed runs:** a run whose gpu-ops process died (exit code null, status `started`) is counted in `spend` at its upper bound until reconciled. Check `gpu-ops ps` for leftovers.
+- **In-flight detached runs** (status `running`) are also counted at their worst case, so the monthly cap keeps reserving what they may still spend. `spend` reports them as `runs_in_flight`, separately from runs that died before teardown.

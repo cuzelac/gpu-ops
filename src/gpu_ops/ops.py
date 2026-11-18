@@ -96,6 +96,10 @@ def reap(providers: dict[str, Provider], *, grace_min: float, max_age_min: float
             continue
         for inst, why in reap_decisions(live, now, grace_min=grace_min, max_age_min=max_age_min):
             ok = None if dry_run else teardown(p, inst.id, timeout_s)
+            # the run id is read out of the instance's own name, never the ledger: the
+            # reaper has to keep working with no local state at all (docs/design.md §4)
+            parsed = parse_instance_name(inst.name)
             results.append({"provider": pname, "id": inst.id, "name": inst.name, "reason": why,
+                            "run_id": parsed.run_id if parsed else None,
                             "terminated": ok, "dry_run": dry_run})
     return results

@@ -6,20 +6,43 @@ The dict returned by `summarize` is a stable interface: the later HTML report re
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .policy import Policy
 
 SINGLE_CARD_VRAM_GB = 96  # an RTX PRO 6000-class card; jobs above this (or multi-GPU) a single card can't replace
+GRACE_MIN = 10  # the reaper's own grace: past the deadline plus this, the machine is gone either way
+
+
+def in_flight(r: dict, now: datetime | None = None) -> bool:
+    """A detached run that is still going, as opposed to one whose process died.
+
+    On disk the two look identical — an instance and no `ended_at` — so without this the
+    report tells the human a healthy `run --detach` "died before teardown". Both are still
+    costed at their upper bound; only the wording differs.
+    """
+    if r.get("status") != "running" or r.get("ended_at"):
+        return False
+    try:
+        deadline = datetime.fromisoformat(r["deadline"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(timezone.utc)) < deadline + timedelta(minutes=GRACE_MIN)
 
 
 def _unfinished(r: dict) -> bool:
-    """A run whose gpu-ops process died before teardown (e.g. kill -9): it has an instance but no end."""
-    return bool(r.get("instance_id")) and not r.get("ended_at") and r.get("cost_billed_usd") is None
+    """A run whose gpu-ops process died before teardown (e.g. kill -9): an instance but no end.
+
+    A detached run still in flight is in that state on purpose, so it is not counted here.
+    """
+    return (bool(r.get("instance_id")) and not r.get("ended_at")
+            and r.get("cost_billed_usd") is None and not in_flight(r))
 
 
 def _upper_bound(r: dict) -> tuple[float, float]:
-    """(usd, seconds) for an unfinished run: billed until its deadline, the latest the dead-man/reaper allow."""
+    """(usd, seconds) for a run with no end: billed until its deadline, the latest the dead-man/reaper allow."""
     try:
         secs = max(0.0, (datetime.fromisoformat(r["deadline"]) - datetime.fromisoformat(r["started_at"])).total_seconds())
     except (KeyError, TypeError, ValueError):
@@ -30,7 +53,9 @@ def _upper_bound(r: dict) -> tuple[float, float]:
 def _cost(r: dict) -> float:
     if r.get("cost_billed_usd") is not None:
         return r["cost_billed_usd"]
-    if _unfinished(r):
+    # an in-flight detached run is priced at its worst case too, so the monthly cap keeps
+    # reserving the money it may still spend
+    if _unfinished(r) or in_flight(r):
         return _upper_bound(r)[0]
     return r.get("cost_estimate_usd") or 0.0
 
@@ -42,12 +67,14 @@ def _derive(r: dict) -> dict:
     is forced here rather than left to the caller's `+=`. The caller counts the record as
     unreadable and commits nothing, so no record can be half-counted.
     """
-    secs = _upper_bound(r)[1] if _unfinished(r) else (r.get("billed_seconds") or 0)
+    secs = (_upper_bound(r)[1] if (_unfinished(r) or in_flight(r))
+            else (r.get("billed_seconds") or 0))
     phases = r.get("phases") or {}
     return {
         "cost": _cost(r) + 0.0,
         "hours": secs / 3600 * (r.get("gpu_count") or 1) + 0.0,
         "unfinished": int(_unfinished(r)),
+        "in_flight": int(in_flight(r)),
         "command_s": phases.get("command", 0) + 0.0,
         "overhead_s": sum(v for k, v in phases.items() if k != "command") + 0.0,
         "not_replaceable": int((r.get("vram_gb") or 0) > SINGLE_CARD_VRAM_GB or (r.get("gpu_count") or 1) > 1),
@@ -76,6 +103,7 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
     not_replaceable = 0
     unreconciled = 0
     unfinished = 0
+    running = 0
     for r in recs:
         try:
             row = _derive(r)
@@ -85,6 +113,7 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
         # from here nothing can raise, so a record is either counted everywhere or nowhere.
         # Tolerating a failure *mid-commit* is how `runs: 0` once shipped beside `total: 7.5`.
         unfinished += row["unfinished"]
+        running += row["in_flight"]
         for key, val in row["by"]:
             b = by[key][val or "?"]
             b["usd"] += row["cost"]
@@ -114,6 +143,8 @@ def summarize(records: list[dict], policy: Policy | None, now: datetime | None =
         "unreadable_records": unreadable,
         "unreconciled_runs": unreconciled,
         "unfinished_runs_counted_at_upper_bound": unfinished,
+        # detached runs still going: also costed at their worst case, but they have not died
+        "runs_in_flight": running,
         "trailing_3mo_monthly_usd": round(trailing, 4),
         "overhead_share": round(overhead_s / (overhead_s + command_s), 3) if (overhead_s + command_s) else None,
         "runs_a_single_card_could_not_replace": not_replaceable,

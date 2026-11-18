@@ -200,6 +200,7 @@ src/gpu_ops/
 | 7 | Transfer or checksum failed |
 | 8 | Time or cost cap hit; job killed |
 | 10 | Teardown failed. Always the most important code, and returned even if another failure also happened |
+| 11 | A detached run is still going; nothing collected and the machine is alive on purpose |
 
 ### Choosing an offer: VRAM is a floor, not the target
 
@@ -228,7 +229,48 @@ src/gpu_ops/
 - **What v1 does to make this possible:** the runner is built as three parts, *acquire* (create, bootstrap, arm), *execute* (upload, setup, command, download) and *release* (teardown). A session is acquire once, execute many times, release once, so adding it later needs no rewrite.
 - **The other big overhead lever:** setup time. Installing pip packages on every run is slow. Later, a prebuilt image per project (same pinned deps, pushed to a registry and pinned by digest) cuts setup to seconds. The phase timings will show whether that is worth doing.
 
-**Long jobs:** v1 runs in the foreground only. A detached mode (`run --detach`, `status`, `collect`) comes after the QLoRA proof. Until then, start long runs from a WSL shell inside tmux, because WSL kills child processes when the launching `wsl.exe` exits.
+### Long jobs: the resident job
+
+**The job lives on the instance, not in the local process.** A launcher written to `/gpuops/run.sh`
+runs the phases under `nohup setsid`, so nothing about the job depends on the process that started
+it. This is what makes `--detach` possible, and it also removes the old tmux workaround: WSL kills
+child processes when the launching `wsl.exe` exits, but the job is not a WSL child any more.
+
+- **`status.json`** on the instance carries `{phase, started_at, pid, exit_code, finished_at, phases}`.
+  The launcher writes it as it moves between phases, so a *later* process can tell what happened
+  without having watched. Phase timings are measured on the instance for the same reason: deriving
+  them from polling missed any phase that began and ended between two polls, and `spend`'s overhead
+  share is computed from exactly those numbers.
+- **`phase` and liveness are both needed.** A job killed by the OOM killer leaves `phase` at
+  `command` for ever; only the missing pid says so. `status` reports that combination as `died`.
+- **Foreground** polls `status.json` over short calls and pumps new `job.log` lines into the local
+  copy each time, so a run whose process is killed outright still leaves something to read.
+- **`--detach`** returns once the job is resident. The single line that skips teardown can only be
+  given a `Resident`, which is built only after the collect plan, the reconnect key and the
+  `running` record are all on disk — so the machine is never left alive before the run is
+  recoverable by someone else.
+- **`collect` never reads the job spec.** The spec lives in the calling project and may have moved
+  or changed by then, so `_launch` snapshots `collect-plan.json` (remote root, declared outputs,
+  `[report]` config) into the run directory. `CollectPlan.load` is the only way to get one back.
+- **The reconnect key** moves from `$XDG_RUNTIME_DIR` / `/dev/shm` to `runs/<id>/key/` at mode 600
+  for a detached run: those are memory-backed and do not survive the reboot the feature exists to
+  tolerate. It is deleted at release. Job secrets reach a resident job through a 0600 `.job_env`
+  that the launcher sources and immediately removes, so after startup they exist only in the job's
+  environment, as they did before.
+- **The collection window** (`policy.limits.detached_collect_minutes`, default 15, capped at half
+  the run) is time kept back before the deadline. The machine dies at the deadline whatever anyone
+  does — the dead-man timer and the reaper both work from the deadline in its name — so anything
+  uncollected by then is lost. `collect` on a machine that is already gone reports exit 7 and says
+  the outputs are lost, rather than pretending to look.
+- **The reaper still never reads the ledger.** It names the reaped `run_id` in its notification by
+  parsing the instance name, which is detail added to its report, not a dependency. Auto-collecting
+  was considered and rejected: it would make the safety net a worker, and give it the ledger, the
+  run directory and the per-run key to depend on.
+- **What exit codes mean.** `run --detach` exits 0 with the machine deliberately alive, which is the
+  one place 0 does not mean "teardown confirmed"; the result says `status: "running"` and
+  `teardown_confirmed: null`. Exit 11 (`STILL_RUNNING`) is new: the job is still going and nothing
+  was collected. It is non-zero on purpose, so a caller reading only the code fails safe instead of
+  believing the outputs are home.
 
 ## 4. Safety layers
 
@@ -398,7 +440,7 @@ Each layer covers the failure of the one before it.
 - Offer selection by `cheapest-job` or `fastest`. The fields and timing records are in v1.
 - The HTML spend report page.
 - Prebuilt per-project images.
-- Detached runs.
+- ~~Detached runs.~~ Built: see "Long jobs: the resident job" above.
 - Serving jobs with exposed ports.
 - Network volumes and S3 inputs.
 - A second adapter: Modal or Vast.
