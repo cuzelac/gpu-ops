@@ -29,12 +29,20 @@ from .planner import Plan
 from .policy import Policy
 from .providers.base import CreateRequest, Instance, Provider
 from .remote import TIMEOUT_EXIT, Remote, TransferError
-from .result import PHASE_MARKER, read_head_bytes
+from .resident import (CollectPlan, RemoteJob, Resident, collect_outputs, env_file_script, finalize,
+                       launcher_script, parse_status, phase_script, status_script)
 from .secrets import Redactor
 from .spec import LoadedSpec
 
 RemoteFactory = Callable[[Instance, Path], "Remote | None"]
 Log = Callable[[str], None]
+
+# how long before the deadline the job is stopped, so collection and teardown still fit
+DEFAULT_COLLECT_WINDOW_S = 300.0
+
+
+def _noop_log(_line: str) -> None:
+    pass
 
 BOOTSTRAP = r"""
 set -e
@@ -80,8 +88,14 @@ class Runner:
         self.provider, self.ledger, self.remote_factory = provider, ledger, remote_factory
         self.redact, self.secrets = redactor, secrets
         self.opts = opts or RunOptions()
-        self.log = log or (lambda s: None)  # phase lines
-        self.job_log = job_log or (lambda s: None)  # echo of the job's output; job.log is written either way
+        self.log = log or _noop_log  # phase lines
+        self.job_log = job_log or _noop_log  # echo of the job's output; job.log is written either way
+        self._echo_log = job_log is not None  # only then is it worth fetching the log while polling
+        self._log_echoed = 0  # lines of the instance's job.log already echoed
+        self.resident: Resident | None = None  # set once the job is running and recoverable
+        self.handed_off: Resident | None = None  # set ONLY by --detach; skips teardown
+        self.collect_window_s = DEFAULT_COLLECT_WINDOW_S  # replaced per run by _collect_window
+        self._detach = False  # what _apply_plan sizes the collection window for
         self.inputs_manifest: dict[str, str] = {}  # kept off the record: see ledger's module docstring
         if ledger.redactor is None:  # the runner is the only writer holding secrets
             ledger.redactor = redactor
@@ -111,6 +125,9 @@ class Runner:
         r.gpu_count, r.vram_gb, r.tier, r.price_per_hr = o.count, o.vram_gb, o.tier, o.price_per_hr
         r.worst_case_usd, r.deadline = round(plan.worst_case_usd, 4), self.deadline.isoformat()
         r.notes = list(dict.fromkeys([*r.notes, *plan.notes]))
+        # recomputed here too: a capacity fallback re-derives the deadline, and a window
+        # sized against the old one would leave the job the wrong amount of time
+        self.collect_window_s = self._collect_window(self._detach)
 
     # ---------- helpers ----------
 
@@ -136,36 +153,80 @@ class Runner:
         self._write_log(line)
         self.job_log(line)
 
-    def _prelude(self) -> str:
-        r = self.opts.remote_root if not self.remote else self.remote.root
-        lines = ["set -euo pipefail",
-                 f"export GPUOPS_ROOT={shlex.quote(r)} GPUOPS_IN={shlex.quote(r + '/in')} "
-                 f"GPUOPS_OUT={shlex.quote(r + '/out')} GPUOPS_WORK={shlex.quote(r + '/work')} "
-                 f"GPUOPS_RUN_ID={shlex.quote(self.run_id)}"]
-        lines += [f"export {k}={shlex.quote(v)}" for k, v in self.secrets.items()]
-        lines += [f"export {k}={_dq(v)}" for k, v in self.spec.env.items()]
-        lines.append('mkdir -p "$GPUOPS_WORK" "$GPUOPS_OUT" && cd "$GPUOPS_WORK"')
-        return "\n".join(lines) + "\n"
+    def _phase_body(self, lines: list[str]) -> str:
+        """One phase's script. `GPUOPS_*` and the secrets come from the launcher's own
+        environment, so a phase cannot run without them."""
+        head = ["set -euo pipefail"]
+        head += [f"export {k}={_dq(v)}" for k, v in self.spec.env.items()]
+        head.append('cd "$GPUOPS_WORK"')
+        return "\n".join(head) + "\n" + "\n".join(lines) + "\n"
 
     def _make_key(self) -> str:
         import os
-        base = os.environ.get("XDG_RUNTIME_DIR") or ("/dev/shm" if Path("/dev/shm").is_dir() else None)
-        self.key_dir = Path(tempfile.mkdtemp(prefix="gpuops-key-", dir=base))
+        if self._detach:
+            # A detached run is reconnected to by a later process, possibly after the PC has
+            # slept or rebooted — which is the whole point. $XDG_RUNTIME_DIR and /dev/shm are
+            # memory-backed and do not survive that, so the key lives beside the run and is
+            # deleted at release, where a foreground run's key already was.
+            self.key_dir = self.run_dir / "key"
+            self.key_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.key_dir, 0o700)
+        else:
+            base = os.environ.get("XDG_RUNTIME_DIR") or ("/dev/shm" if Path("/dev/shm").is_dir() else None)
+            self.key_dir = Path(tempfile.mkdtemp(prefix="gpuops-key-", dir=base))
         key = self.key_dir / "id_ed25519"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"gpuops-{self.run_id}", "-f", str(key)],
                        check=True, capture_output=True)
+        if self._detach:
+            os.chmod(key, 0o600)
+            # a state directory on a Windows drive cannot hold the mode; say so rather than
+            # implying a protection that is not there
+            if (key.stat().st_mode & 0o077) != 0:
+                self.record.notes.append(
+                    f"the reconnect key at {key} is not private to you (mode "
+                    f"{key.stat().st_mode & 0o777:o}); the state directory's filesystem cannot hold it")
         return (self.key_dir / "id_ed25519.pub").read_text().strip()
+
+    def key_path(self) -> Path | None:
+        return None if self.key_dir is None else self.key_dir / "id_ed25519"
 
     # ---------- lifecycle ----------
 
-    def run(self) -> tuple[ExitCode, RunRecord]:
+    def _collect_window(self, detach: bool) -> float:
+        """How much time to keep back after the job for collection and teardown.
+
+        A foreground run collects the moment the job ends, so today's reserve is enough. A
+        detached one is collected whenever its caller comes back, and nothing between the
+        job finishing and the deadline will save the outputs — the dead-man timer deletes
+        the machine and everything on it. Never more than half the run, so asking for a
+        generous window cannot leave no time to do the work.
+        """
+        if not detach:
+            return self.reserve_s
+        want = self.policy.limits.detached_collect_minutes * 60
+        return min(max(self.reserve_s, want), 0.5 * self.plan.run_minutes * 60)
+
+    def run(self, *, detach: bool = False) -> tuple[ExitCode, RunRecord]:
         code = ExitCode.OK
         self.record.started_at = self.started.isoformat()
+        self._detach = detach
+        self.collect_window_s = self._collect_window(detach)
         self.ledger.event(self.run_id, "creating", provider=self.provider.name, name=self.name,
                           deadline=self.deadline.isoformat(), job=self.spec.name, project=self.spec.project)
         try:
             self._hash_inputs()
             self._acquire()
+            if detach:
+                self._upload()
+                # from here the machine is deliberately left alive. Assigning `handed_off`
+                # is the single line that skips teardown, and it can only be given a
+                # `Resident`, which `_launch` makes only once the plan, the key and the
+                # record are on disk — so the skip cannot happen before the run is
+                # recoverable by someone else.
+                self.resident = self.handed_off = self._launch()
+                self.log(f"detached: run {self.run_id} is running on {self.record.instance_id}; "
+                         f"collect by {self.job_deadline():%H:%M:%S} UTC")
+                return ExitCode.OK, self.record
             self._execute()
         except GpuOpsError as e:
             code, self.record.error = e.code, e.message
@@ -176,7 +237,11 @@ class Runner:
         except Exception as e:  # a bug in gpu-ops: still tear down, and say so
             code, self.record.error = ExitCode.INTERNAL, f"internal error: {e!r}"
         finally:
-            code = worst(code, self._release())
+            # `handed_off`, not `resident`: a foreground run is resident too, and must still
+            # be torn down here. Only the detach branch ever hands the machine over.
+            if self.handed_off is None:
+                self._fetch_job_log()
+                code = worst(code, self._release())
         self.record.exit_code = int(code)
         self.record.status = "ok" if code == ExitCode.OK else "failed"
         if self.spec.report is not None and self.record.report is None:
@@ -312,6 +377,13 @@ class Runner:
                                                 f"policy's allow_unarmed_deadman_minutes ({limit})")
 
     def _execute(self) -> None:
+        self._upload()
+        self.resident = self._launch()
+        self._await_job()
+        with self._phase("download"):
+            self._collect()
+
+    def _upload(self) -> None:
         assert self.remote is not None
         remote = self.remote
         with self._phase("upload"):
@@ -326,89 +398,141 @@ class Runner:
                 if problems:
                     raise GpuOpsError(ExitCode.TRANSFER_FAILED, "upload verification failed: " + "; ".join(problems[:5]))
 
-        for phase, lines in (("setup", self.spec.run.setup), ("command", [self.spec.run.command])):
-            if not lines:
-                continue
-            with self._phase(phase):
-                self._write_log(PHASE_MARKER + phase)  # so `gpu-ops logs --phase` can split the log
-                budget = self._remaining(reserve=True)
-                if budget <= 0:
-                    raise GpuOpsError(ExitCode.CAP_HIT, f"no time left for {phase}")
-                rc = remote.run(self._prelude() + "\n".join(lines) + "\n", timeout_s=budget, on_line=self._job_log)
-                if rc == TIMEOUT_EXIT:
-                    raise GpuOpsError(ExitCode.CAP_HIT, f"{phase} hit the deadline and was killed")
-                if rc != 0:
-                    raise GpuOpsError(ExitCode.JOB_FAILED, f"{phase} exited with code {rc} (see job.log)")
+    def job_deadline(self) -> datetime:
+        """When the job itself must stop, leaving the collection window before the deadline.
 
-        with self._phase("download"):
-            self._collect()
+        The instance dies at `self.deadline` — the dead-man timer and the reaper both work
+        from it — so everything that has to happen *after* the job has to fit before it.
+        """
+        return self.deadline - timedelta(seconds=self.collect_window_s)
+
+    def _launch(self) -> Resident:
+        """Start the job on the instance and make the run recoverable without this process.
+
+        The order matters and is the whole safety argument for `--detach`: the collect plan,
+        the reconnect key and the `running` record are all on disk *before* a `Resident`
+        exists, so a `Resident` is proof that someone else can finish this run.
+        """
+        assert self.remote is not None and self.instance is not None
+        remote = self.remote
+        with self._phase("launch"):
+            budget = (self.job_deadline() - _utc()).total_seconds()
+            if budget <= 0:
+                raise GpuOpsError(ExitCode.CAP_HIT, "no time left to run the job before its collection window")
+            phases = [p for p, lines in (("setup", self.spec.run.setup),
+                                         ("command", [self.spec.run.command])) if lines]
+            if self.secrets:
+                if remote.run(env_file_script(remote.root, self.secrets), timeout_s=120) != 0:
+                    raise GpuOpsError(ExitCode.PROVIDER_ERROR, "could not write the job environment")
+            for phase in phases:
+                lines = self.spec.run.setup if phase == "setup" else [self.spec.run.command]
+                if remote.run(phase_script(remote.root, phase, self._phase_body(lines)), timeout_s=120) != 0:
+                    raise GpuOpsError(ExitCode.PROVIDER_ERROR, f"could not write the {phase} script")
+            self.collect_plan().save(self.run_dir)
+            started = _utc()
+            rc = remote.run(launcher_script(remote.root, phases, int(self.job_deadline().timestamp()),
+                                            self.run_id), timeout_s=120)
+            if rc != 0:
+                raise GpuOpsError(ExitCode.PROVIDER_ERROR, f"could not start the job on the instance (exit {rc})")
+            job = self._job_status()
+            self.record.status = "running"
+            self.record.notes.append(f"job runs on the instance; collect by {self.job_deadline().isoformat()}")
+            self.ledger.event(self.run_id, "running", instance_id=self.instance.id, pid=job.pid)
+            # take back the redacted copy the ledger wrote, so the record this run carries
+            # from here on is the one on disk
+            self.record = self.ledger.write_record(self.record)
+            return Resident(instance_id=self.instance.id, run_id=self.run_id, pid=job.pid,
+                            launched_at=started.isoformat(),
+                            job_deadline_epoch=int(self.job_deadline().timestamp()))
+
+    def _job_status(self) -> RemoteJob:
+        assert self.remote is not None
+        lines: list[str] = []
+        self.remote.run(status_script(self.remote.root), timeout_s=120, on_line=lines.append)
+        return parse_status(lines)
+
+    def _await_job(self) -> None:
+        """Poll the resident job until it ends, timing each phase as it goes past.
+
+        Polling, not streaming: the job's output goes to `job.log` on the instance and is
+        brought back once, so a thousand progress lines cost one download instead of a
+        thousand lines of someone's context (#2).
+        """
+        while True:
+            job = self._job_status()
+            self._pump_job_log()
+            if job.finished or job.died:
+                self.record.phases.update(job.phases)
+            if job.finished:
+                if job.exit_code == TIMEOUT_EXIT:
+                    raise GpuOpsError(ExitCode.CAP_HIT, "the job hit its deadline and was killed")
+                if job.exit_code != 0:
+                    raise GpuOpsError(ExitCode.JOB_FAILED,
+                                      f"the job exited with code {job.exit_code} (see `gpu-ops logs`)")
+                return
+            if job.died:
+                raise GpuOpsError(ExitCode.JOB_FAILED,
+                                  "the job's process disappeared without finishing (killed on the "
+                                  "instance, e.g. out of memory); see `gpu-ops logs`")
+            if (self.job_deadline() - _utc()).total_seconds() <= 0:
+                raise GpuOpsError(ExitCode.CAP_HIT, "the job did not finish before its collection window")
+            time.sleep(self.opts.poll_s)
+
+    def _pump_job_log(self) -> None:
+        """Copy whatever the job has written since the last poll into the local job.log.
+
+        Done on every poll, not only with `--progress`: the log is the only account of what
+        the job did, and a run whose process is killed outright never reaches the full fetch
+        at teardown. Keeping the local copy current is what leaves a `kill -9`'d run
+        something to read.
+        """
+        assert self.remote is not None
+        lines: list[str] = []
+        try:
+            self.remote.run(
+                f"tail -n +{self._log_echoed + 1} {shlex.quote(self.remote.root)}/job.log 2>/dev/null || true\n",
+                timeout_s=120, on_line=lines.append)
+        except Exception:
+            return  # a poll that could not read the log is not a reason to fail the run
+        for line in lines:
+            self._job_log(line)  # redacts, writes the local job.log, and echoes if asked
+        self._log_echoed += len(lines)
+
+    def _fetch_job_log(self) -> None:
+        """Bring the job's log home before the machine goes away. Best effort, always tried.
+
+        The log is the only account of what the job did; losing it to a failed teardown or a
+        cap hit would leave the caller with an exit code and nothing to read.
+        """
+        if self.remote is None:
+            return
+        lines: list[str] = []
+        try:
+            self.remote.run(f"cat {shlex.quote(self.remote.root)}/job.log 2>/dev/null || true\n",
+                            timeout_s=300, on_line=lines.append)
+        except Exception as e:  # a log we could not fetch must not hide the run's own outcome
+            self.record.notes.append(f"could not fetch job.log from the instance: {type(e).__name__}")
+            return
+        # only replace the incrementally pumped copy with one that is at least as complete:
+        # a short read from a dying machine must not destroy what we already have
+        if lines and len(lines) >= self._log_echoed:
+            (self.run_dir / "job.log").write_text(
+                "".join(self.redact(line) + "\n" for line in lines), encoding="utf-8")
+            self._log_echoed = len(lines)
+
+    def collect_plan(self) -> CollectPlan:
+        """What `collect` needs, taken from the spec while the spec is still in hand.
+
+        Built from the live remote's root, not `opts.remote_root`: the fake provider's
+        instances live under their own directory, and a plan that named the wrong root
+        would look for outputs that were never there.
+        """
+        assert self.remote is not None
+        return CollectPlan.from_spec(self.spec, self.remote.root)
 
     def _collect(self) -> None:
         assert self.remote is not None
-        rels = [o.path for o in self.spec.outputs]
-        if not rels:
-            self.record.outputs_verified = True
-            self._read_report(self.run_dir / "out")
-            return
-        out_lines: list[str] = []
-        rc = self.remote.run(remote_manifest_script(self.remote.root + "/out", rels), timeout_s=900,
-                             on_line=out_lines.append)
-        if rc != 0:
-            raise GpuOpsError(ExitCode.TRANSFER_FAILED, f"could not list outputs on the instance (exit {rc})")
-        expected, missing = parse_sha256sum("\n".join(out_lines))
-        local_out = self.run_dir / "out"
-        for o in self.spec.outputs:
-            if o.path not in missing:
-                self.remote.get(f"out/{o.path}", self.run_dir)
-        got = build_manifest(local_out, [r for r in rels if r not in missing and (local_out / r).exists()])
-        self.record.outputs_manifest = got
-        problems = compare(expected, got)
-        self.record.outputs_verified = not problems
-        required_missing = [o.path for o in self.spec.outputs if o.required and o.path in missing]
-        if problems:
-            raise GpuOpsError(ExitCode.TRANSFER_FAILED, "output verification failed: " + "; ".join(problems[:5]))
-        if required_missing:
-            raise GpuOpsError(ExitCode.JOB_FAILED, f"required outputs missing: {required_missing}")
-        self._read_report(local_out)
-
-    def _read_report(self, local_out: Path) -> None:
-        """Include the spec's [report] files in the record, read from the verified local copies.
-
-        Only ever called once the outputs are downloaded and their checksums match, so what
-        reaches the result is data gpu-ops has verified.
-        """
-        rs = self.spec.report
-        if rs is None:
-            return
-        report: dict = {}
-        for rel in rs.files:
-            path = local_out / rel
-            if not path.is_file():
-                report[rel] = None
-                self.record.notes.append(f"report file missing from the outputs: {rel}")
-                continue
-            # read the cap, never the whole file: a report file is an output, and outputs
-            # can be checkpoints. Secrets are redacted once, per field, in run().
-            try:
-                raw, size = read_head_bytes(path, rs.max_bytes)
-            except GpuOpsError as e:
-                # a file that vanished or turned unreadable between the check and the read is
-                # the missing-optional-output case, not an internal error
-                report[rel] = None
-                self.record.notes.append(f"report file could not be read: {rel} ({e.message})")
-                continue
-            text = raw.decode("utf-8", "replace")
-            if size > rs.max_bytes:
-                report[rel] = {"truncated": True, "bytes": size, "text": text}
-                continue
-            if path.suffix.lower() == ".json":
-                try:
-                    report[rel] = json.loads(text)
-                except json.JSONDecodeError as e:
-                    report[rel] = {"text": text, "parse_error": str(e)}
-                continue
-            report[rel] = {"text": text}
-        self.record.report = report
+        collect_outputs(self.remote, self.run_dir, self.collect_plan(), self.record)
 
     def _release(self) -> ExitCode:
         ok = False
@@ -432,15 +556,13 @@ class Runner:
                 self.record.ended_at = ended.isoformat()
                 if self.key_dir:
                     shutil.rmtree(self.key_dir, ignore_errors=True)
+                    self.key_dir = None
         self.record.teardown_confirmed = ok
         if self.instance is None:
             self.ledger.event(self.run_id, "terminated" if ok else "unknown")
             return ExitCode.OK if ok else ExitCode.TEARDOWN_FAILED
-        if self.instance is not None:
-            secs = (ended - self.started).total_seconds()
-            self.record.billed_seconds = round(secs, 1)
-            price = self.record.price_per_hr or self.plan.offer.price_per_hr
-            self.record.cost_estimate_usd = round(price * secs / 3600, 4)
+        finalize(self.record, started=self.started, ended=ended,
+                 price_per_hr=self.record.price_per_hr or self.plan.offer.price_per_hr, teardown_ok=ok)
         self.ledger.event(self.run_id, "terminated" if ok else "live", instance_id=self.record.instance_id)
         if not ok:
             self.log(f"TEARDOWN FAILED — INSTANCE MAY STILL BE BILLING: {self.provider.name} {self.record.instance_id}")

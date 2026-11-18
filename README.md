@@ -21,7 +21,8 @@ Rent a cloud GPU, run a job, bring the results home, and shut it down. Every tim
 | `spend --reconcile` against RunPod billing | Not verified: RunPod returned no billing records for these runs yet (lag?) |
 | Unattended 1Password access (service account) | **Verified 2026-11-16.** `ps` and `plan` read the RunPod key from the `gpu-ops` vault with the desktop-app route disabled; no prompt, ~4.6 s per command |
 | HS-AI-Coach QLoRA job | Not run yet. Needs your OK, because it spends money |
-| Sessions, detached runs, serving, volumes, HTML spend report, second provider | Designed, not built ([docs/design.md](docs/design.md)) |
+| Detached runs (`run --detach`, `status`, `wait`, `collect`) | **Built**, verified against the fake provider only: launch returns in under a second, poll, collect, idempotent re-collect, a job that fails, a job killed mid-run, and the machine dying before `collect`. Not yet exercised on RunPod |
+| Sessions, serving, volumes, HTML spend report, second provider | Designed, not built ([docs/design.md](docs/design.md)) |
 
 ## Install (once, inside WSL)
 

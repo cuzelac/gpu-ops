@@ -19,6 +19,10 @@ class ExitCode(IntEnum):
     TRANSFER_FAILED = 7  # rsync failed or checksums did not match
     CAP_HIT = 8  # time or cost cap reached; job killed
     TEARDOWN_FAILED = 10  # instance may still be billing
+    # A detached run is still going: nothing was collected, and the machine is alive on
+    # purpose. Non-zero deliberately — a caller reading only the code must not mistake this
+    # for "finished, the outputs are home".
+    STILL_RUNNING = 11
 
 
 def worst(*codes: ExitCode) -> ExitCode:

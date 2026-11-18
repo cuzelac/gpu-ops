@@ -187,27 +187,52 @@ def cmd_run(args) -> int:
     secrets = {k: read_op(ref, redactor) for k, ref in loaded.spec.secrets.items()}
     provider = providers[plan.offer.provider]
     progress = bool(getattr(args, "progress", False))
+    detach = bool(getattr(args, "detach", False))
     # phase lines for a human watching a terminal, or on request; the job's own output only on request
     log = _err if (progress or sys.stderr.isatty()) else _noop
-    job_log = (lambda line: _err("  | " + line)) if progress else _noop
+    # None, not a no-op: the runner only pays to fetch the job's log when someone reads it
+    job_log = (lambda line: _err("  | " + line)) if progress else None
     _install_signal_handlers()
     runner = Runner(loaded, plan, policy, provider, ledger, provider.remote_for, redactor, secrets,
                     log=log, job_log=job_log)
-    code, rec = runner.run()
+    code, rec = runner.run(detach=detach)
     shown: dict = {}  # filled by work(), which runs inside _finish's guard
 
     def work() -> dict:
         run_dir = ledger.run_dir(rec.run_id)
         record = rec.to_dict()  # already redacted field by field, by the ledger
-        shown["brief"] = result(code, **compact(record, run_dir, [o.path for o in loaded.spec.outputs]))
+        brief = result(code, **compact(record, run_dir, [o.path for o in loaded.spec.outputs]))
+        if detach and code == ExitCode.OK:
+            brief.update({
+                "detached": True,
+                "instance_id": rec.instance_id,
+                "deadline": rec.deadline,
+                "collect_by": runner.job_deadline().isoformat(),
+                "collect_window_min": round(runner.collect_window_s / 60, 1),
+                "next": f"gpu-ops status {rec.run_id}",
+            })
+        shown["brief"] = brief
         shown["run_dir"] = run_dir
         if getattr(args, "full", False):
             return result(code, run_id=rec.run_id, run_dir=str(run_dir), record=record)
-        return shown["brief"]
+        return brief
 
     # the run is over and its code is known, so that is the honest fallback
-    return _finish(args, work, lambda _r: _human_run(shown["brief"], shown["run_dir"]),
+    return _finish(args, work,
+                   lambda _r: (_human_detached(shown["brief"]) if shown["brief"].get("detached")
+                               else _human_run(shown["brief"], shown["run_dir"])),
                    fallback=int(code))
+
+
+def _human_detached(b: dict) -> str:
+    return "\n".join([
+        f"DETACHED run {b['run_id']} is running on {b['instance_id']}",
+        f"  {b['gpu']} ({b['tier']}) at ${b['price_per_hr']}/hr   dead-man: {b['deadman']}",
+        f"  collect by {b['collect_by']} ({b['collect_window_min']} min before the deadline);"
+        f" anything not collected by then is lost",
+        f"  check:   gpu-ops status {b['run_id']}",
+        f"  finish:  gpu-ops collect {b['run_id']}   (or `wait` to block until it is done)",
+    ] + [f"  note: {n}" for n in b["notes"]])
 
 
 def _human_run(b: dict, run_dir) -> str:
@@ -230,16 +255,87 @@ def _human_run(b: dict, run_dir) -> str:
     return "\n".join(lines)
 
 
+def _detached(args):
+    """Reattach to a detached run, or say why it cannot be reached."""
+    from .detached import Detached
+    redactor = Redactor()
+    ledger = Ledger(redactor=redactor)
+    log = _err if sys.stderr.isatty() or getattr(args, "progress", False) else _noop
+    return Detached.load(ledger, args.run_id, _all_providers(redactor), log=log)
+
+
+def cmd_status(args) -> int:
+    """What a detached run is doing. Free, and changes nothing.
+
+    Exits 0 whenever it could report — like `ps`, this is an observation. What the *job* did
+    is in `phase` and `job_exit_code`; `collect` is what turns that into the run's own code.
+    """
+    d = _detached(args)
+    return _finish(args, lambda: result(ExitCode.OK, **d.status()), lambda r: "\n".join(
+        [f"run {r['run_id']}: {r['phase']} (status {r['status']})",
+         f"  elapsed {r['elapsed_min']} min, deadline in {r['minutes_to_deadline']} min, "
+         f"~${r['cost_so_far_usd']}"]
+        + ([f"  collect by {r['collect_by']}"] if not r["collected"] else [])
+        + ([f"  job exit code {r['job_exit_code']}"] if r["job_exit_code"] is not None else [])
+        + ([f"  | {r['last_log_line']}"] if r["last_log_line"] else [])
+        + ([f"  error: {r['error']}"] if r["error"] else [])))
+
+
+def _collect_result(d, code: int, raw: dict) -> dict:
+    run_dir = d.run_dir
+    declared = [o.path for o in d.plan.outputs]
+    return result(code, **compact(raw, run_dir, declared))
+
+
+def cmd_collect(args) -> int:
+    """Bring a detached run's outputs home and shut the machine down. Idempotent.
+
+    Exit 11 means the job is still going and nothing was touched, so
+    `until gpu-ops collect ID; do sleep 60; done` is a correct poll loop.
+    """
+    d = _detached(args)
+
+    def work() -> dict:
+        code, raw = d.collect()
+        return _collect_result(d, int(code), raw)
+
+    # it may already have terminated the instance by the time anything goes wrong here
+    return _finish(args, work, lambda r: _human_run(r, d.run_dir),
+                   fallback=int(ExitCode.TEARDOWN_FAILED))
+
+
+def cmd_wait(args) -> int:
+    """Block until a detached run ends, then collect. Streams nothing; prints one object."""
+    d = _detached(args)
+
+    def work() -> dict:
+        code, raw = d.wait(args.timeout, poll_s=args.poll)
+        return _collect_result(d, int(code), raw)
+
+    return _finish(args, work, lambda r: _human_run(r, d.run_dir),
+                   fallback=int(ExitCode.TEARDOWN_FAILED))
+
+
 def cmd_logs(args) -> int:
     if not is_run_id(args.run_id):  # never let a caller-supplied id become a path
         raise GpuOpsError(ExitCode.SPEC_INVALID,
                           f"{args.run_id!r} is not a run id (expected e.g. 20261112T140915-7a06)")
     path = Ledger().run_dir(args.run_id) / "job.log"
+    source = "local"
+    if not path.is_file():
+        # a detached run writes its log on the instance; until it is collected there is
+        # nothing local to read, so fetch it rather than claiming the run has no log
+        try:
+            if _detached(args).fetch_log():
+                source = "instance"
+        except GpuOpsError:
+            pass  # not a detached run, or the machine is unreachable: fall through to the error
     if not path.is_file():
         raise GpuOpsError(ExitCode.SPEC_INVALID, f"no job log for run {args.run_id!r} ({path} does not exist)")
+
     def work() -> dict:
         lines, in_file, matched = read_log(path, tail=args.tail, grep=args.grep, phase=args.phase)
-        return result(0, run_id=args.run_id, path=str(path),
+        return result(0, run_id=args.run_id, path=str(path), source=source,
                       lines_in_file=in_file, lines_matched=matched, lines=lines)
 
     return _finish(args, work, lambda r: "\n".join(r["lines"]))
@@ -326,6 +422,9 @@ def cmd_spend(args) -> int:
                                     f"break-even in {rvb['months_to_break_even_at_trailing_rate']} months at this rate")
         if s["unfinished_runs_counted_at_upper_bound"]:
             lines.append(f"{s['unfinished_runs_counted_at_upper_bound']} run(s) died before teardown; counted at their deadline (upper bound)")
+        if s["runs_in_flight"]:
+            lines.append(f"{s['runs_in_flight']} detached run(s) still going; counted at their worst case "
+                         f"until collected (`gpu-ops status RUN_ID`)")
         if s["unreconciled_runs"]:
             lines.append(f"{s['unreconciled_runs']} run(s) still use estimates (run `gpu-ops spend --reconcile`)")
         if s["unreadable_records"]:
@@ -366,15 +465,36 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("plan", parents=[common], help="choose an offer and price the run; creates nothing (free). "
                                                        "Same as `run --dry-run`.")
     s.add_argument("spec")
-    s.set_defaults(fn=cmd_run, dry_run=True, progress=False, full=False)
+    s.set_defaults(fn=cmd_run, dry_run=True, progress=False, full=False, detach=False)
     s = sub.add_parser("run", parents=[common], help="run a job (COSTS MONEY unless --dry-run)")
     s.add_argument("spec")
     s.add_argument("--dry-run", action="store_true", help="plan and price only; create nothing")
+    s.add_argument("--detach", action="store_true",
+                   help="start the job on the instance and return at once with its run id. The machine "
+                        "stays alive: finish with `gpu-ops collect RUN_ID` (or `wait`) before the "
+                        "collection window closes, or the outputs are lost")
     s.add_argument("--full", action="store_true", help="print the whole run record instead of the compact summary")
     s.add_argument("--progress", action="store_true", help="stream phase lines and the job's output to stderr "
                                                             "(job.log is written either way)")
     s.add_argument("--quiet", action="store_true", help="accepted for compatibility; output is quiet by default")
     s.set_defaults(fn=cmd_run)
+    s = sub.add_parser("status", parents=[common],
+                       help="what a detached run is doing, in one small object (free)")
+    s.add_argument("run_id")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("collect", parents=[common],
+                       help="bring a detached run's outputs home and delete the machine; "
+                            "exit 11 if the job is still running")
+    s.add_argument("run_id")
+    s.set_defaults(fn=cmd_collect)
+    s = sub.add_parser("wait", parents=[common],
+                       help="block until a detached run finishes, then collect it (streams nothing)")
+    s.add_argument("run_id")
+    s.add_argument("--timeout", type=float, default=0,
+                   help="give up waiting after this many seconds and exit 11 (default: wait for the "
+                        "collection window)")
+    s.add_argument("--poll", type=float, default=15, help="seconds between checks (default 15)")
+    s.set_defaults(fn=cmd_wait)
     s = sub.add_parser("logs", parents=[common], help="print lines from a finished run's job.log (free)")
     s.add_argument("run_id")
     s.add_argument("--tail", type=int, default=DEFAULT_LOG_TAIL,
